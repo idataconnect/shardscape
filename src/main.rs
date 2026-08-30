@@ -60,6 +60,23 @@ enum Command {
         #[arg(short, long, default_value = "config.toml")]
         config: String,
     },
+    /// Create an S3 access key with a scoped policy.
+    CreateUser {
+        #[arg(short, long, default_value = "config.toml")]
+        config: String,
+        /// The access key id (e.g. "backup", "readonly-app").
+        #[arg(long)]
+        access_key: String,
+        /// Secret key. Generated if omitted.
+        #[arg(long)]
+        secret_key: Option<String>,
+        /// Preset policy: "admin", "readonly", "readwrite".
+        #[arg(long, default_value = "readwrite")]
+        preset: String,
+        /// Restrict to a single bucket (applies to readonly/readwrite presets).
+        #[arg(long)]
+        bucket: Option<String>,
+    },
     /// Render Kubernetes manifests for this node to stdout (or a directory).
     /// Manifests are an output of config — never a hand-edited input.
     RenderK8s {
@@ -159,6 +176,8 @@ async fn main() -> anyhow::Result<()> {
             run_server(config, Some(peer), Some(secret)).await
         }
         Command::Status { config } => run_status(config).await,
+        Command::CreateUser { config, access_key, secret_key, preset, bucket } =>
+            run_create_user(config, access_key, secret_key, preset, bucket).await,
         Command::RenderK8s { config, out } => run_render_k8s(config, out).await,
     }
 }
@@ -1053,6 +1072,91 @@ async fn run_init(args: InitArgs) -> anyhow::Result<()> {
     println!("  Add another site: shardscape join {} --secret {}", config.server.advertise_addr, cluster_secret);
     println!();
     Ok(())
+}
+
+/// `shardscape create-user` — create an S3 access key with a scoped policy.
+async fn run_create_user(
+    config_path: String,
+    access_key: String,
+    secret_key: Option<String>,
+    preset: String,
+    bucket: Option<String>,
+) -> anyhow::Result<()> {
+    let config = config::Config::load(&config_path)?;
+    let clock = Arc::new(clock::ClusterClock::new(config.server.clock_offset_ms));
+    let db = db::Db::new(
+        &config.database.db_path,
+        config.storage.local_location_id.clone(),
+        clock,
+    )
+    .await?;
+
+    let policy = match preset.as_str() {
+        "admin" => admin_policy(),
+        "readonly" => readonly_policy(bucket.as_deref()),
+        "readwrite" => readwrite_policy(bucket.as_deref()),
+        other => anyhow::bail!(
+            "Unknown preset '{}'. Use \"admin\", \"readonly\", or \"readwrite\".",
+            other
+        ),
+    };
+
+    let secret = secret_key.unwrap_or_else(|| random_hex(24));
+    db.create_user(&access_key, &secret, &policy).await?;
+
+    let scope = bucket.as_deref().unwrap_or("all buckets");
+    println!("\n  User '{}' created ({} on {}).\n", access_key, preset, scope);
+    println!("  Access key: {access_key}");
+    println!("  Secret key: {secret}");
+    println!();
+    Ok(())
+}
+
+fn readonly_policy(bucket: Option<&str>) -> db::Policy {
+    let resource = match bucket {
+        Some(b) => format!("arn:ss:bucket:::{}*", b),
+        None => "*".to_string(),
+    };
+    db::Policy {
+        statements: vec![db::PolicyStatement {
+            effect: "Allow".to_string(),
+            actions: vec![
+                "s3:GetObject".to_string(),
+                "s3:HeadObject".to_string(),
+                "s3:ListBucket".to_string(),
+                "s3:ListAllMyBuckets".to_string(),
+                "s3:ListMultipartUploadParts".to_string(),
+                "s3:ListBucketMultipartUploads".to_string(),
+            ],
+            resources: vec![resource],
+        }],
+    }
+}
+
+fn readwrite_policy(bucket: Option<&str>) -> db::Policy {
+    let resource = match bucket {
+        Some(b) => format!("arn:ss:bucket:::{}*", b),
+        None => "*".to_string(),
+    };
+    db::Policy {
+        statements: vec![db::PolicyStatement {
+            effect: "Allow".to_string(),
+            actions: vec![
+                "s3:GetObject".to_string(),
+                "s3:HeadObject".to_string(),
+                "s3:PutObject".to_string(),
+                "s3:DeleteObject".to_string(),
+                "s3:ListBucket".to_string(),
+                "s3:ListAllMyBuckets".to_string(),
+                "s3:CreateBucket".to_string(),
+                "s3:DeleteBucket".to_string(),
+                "s3:AbortMultipartUpload".to_string(),
+                "s3:ListMultipartUploadParts".to_string(),
+                "s3:ListBucketMultipartUploads".to_string(),
+            ],
+            resources: vec![resource],
+        }],
+    }
 }
 
 /// `shardscape status` — local cluster, replication, and GC health.

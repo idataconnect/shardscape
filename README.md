@@ -93,6 +93,32 @@ production deployments — see the [bare-metal guide](docs/BAREMETAL.md).
 shardscape status --config /var/lib/shardscape/config.toml
 ```
 
+### Create access keys
+
+`shardscape init` bootstraps an admin user. To create scoped credentials for
+applications or backup agents:
+
+```sh
+# Read-only access to all buckets
+shardscape create-user --access-key backup-app --preset readonly
+
+# Read-write access to a single bucket
+shardscape create-user --access-key writer --preset readwrite --bucket photos
+
+# Full admin access
+shardscape create-user --access-key superuser --preset admin
+```
+
+Presets:
+- **readonly** — get, head, and list operations
+- **readwrite** — all object and bucket operations (default)
+- **admin** — unrestricted access
+
+Use `--bucket <name>` to restrict readonly or readwrite access to a single
+bucket. The secret key is auto-generated if `--secret-key` is not provided.
+Credentials replicate to all sites via the fact log — create them once on any
+node.
+
 ## Networking
 
 | Port | Purpose | Notes |
