@@ -1,0 +1,74 @@
+# Rendered by `shardscape render-k8s` for site 'site-a'. Do not hand-edit;
+# re-render from config.toml instead.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shardscape
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shardscape-data-site-a
+  namespace: shardscape
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shardscape-site-a
+  namespace: shardscape
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: shardscape, site: site-a }
+  template:
+    metadata:
+      labels: { app: shardscape, site: site-a }
+    spec:
+      initContainers:
+        # Idempotently initialise this site on first boot. The generated admin +
+        # cluster secrets appear in this container's logs; capture them to add
+        # more sites (`shardscape join`). Re-runs are a no-op once config exists.
+        - name: init
+          image: shardscape:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              test -f /data/config.toml ||
+              /usr/local/bin/shardscape init --config /data/config.toml --data-dir /data
+              --location-id site-a --s3-addr 0.0.0.0:8014
+              --internal-addr 0.0.0.0:8015
+              --advertise http://shardscape-site-a.shardscape.svc.cluster.local:8015
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      containers:
+        - name: shardscape
+          image: shardscape:latest
+          args: ["serve", "--config", "/data/config.toml"]
+          ports:
+            - { containerPort: 8014, name: s3 }
+            - { containerPort: 8015, name: internal }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          readinessProbe:
+            tcpSocket: { port: s3 }
+            initialDelaySeconds: 2
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: shardscape-data-site-a
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shardscape-site-a
+  namespace: shardscape
+spec:
+  selector: { app: shardscape, site: site-a }
+  ports:
+    - { name: s3, port: 8014, targetPort: s3 }
+    - { name: internal, port: 8015, targetPort: internal }

@@ -1,0 +1,38 @@
+[package]
+name = "shardscape"
+version = "0.1.0"
+edition = "2024"
+description = "Self-hosted, multi-site, S3-compatible object store with global content-addressed deduplication"
+license = "Apache-2.0"
+
+[dependencies]
+s3s = "0.11.1"
+tokio = { version = "1.0", features = ["full"] }
+hyper = { version = "1.0", features = ["client", "http1", "server"] }
+blake3 = "1.5"
+# TLS is punted to a reverse proxy / ingress, so no TLS backend is built in.
+# reqwest is only used by the optional SeaweedFS block backend, over plain HTTP.
+reqwest = { version = "0.11", default-features = false, features = ["json", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tower = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1.0", features = ["v4"] }
+bytes = "1.0"
+async-trait = "0.1.89"
+futures-util = "0.3.32"
+anyhow = "1.0.102"
+rand = "0.8"
+hyper-util = { version = "0.1.3", features = ["server-auto", "tokio"] }
+md-5 = { version = "0.10", features = ["asm"] }
+hex = "0.4"
+toml = "0.8"
+fastcdc = "3.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2"
+http-body-util = "0.1.3"
+http-body = "1.0.1"
+clap = { version = "4.6.1", features = ["derive"] }
+snow = "0.10"
+base64 = "0.22"

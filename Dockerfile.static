@@ -1,0 +1,25 @@
+# Optional fully-static build. The default `Dockerfile` (glibc / debian-slim)
+# stays the primary image; this one is for people who want a single portable
+# binary that runs on anything, including `FROM scratch`.
+#
+# rust:alpine targets x86_64-unknown-linux-musl natively, so `cargo build` here
+# produces a static binary (SQLite is compiled in via rusqlite's bundled feature;
+# no TLS backend is built, so there are no C library runtime deps at all).
+FROM rust:alpine AS builder
+RUN apk add --no-cache musl-dev
+WORKDIR /usr/src/shardscape
+
+# Prefetch dependencies in their own layer.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src \
+    && echo 'fn main() { println!("docker-fetch-dummy"); }' > src/main.rs \
+    && cargo build --release
+COPY src ./src
+RUN touch src/main.rs && cargo build --release --locked
+
+# Nothing but the binary. No libc, no ca-certs — TLS terminates at a proxy.
+FROM scratch
+COPY --from=builder /usr/src/shardscape/target/release/shardscape /shardscape
+EXPOSE 8014 8015
+ENTRYPOINT ["/shardscape"]
+CMD ["serve", "--config", "/data/config.toml"]

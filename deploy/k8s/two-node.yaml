@@ -1,0 +1,101 @@
+# Two-site Shardscape in one cluster, for validating cross-site replication.
+# Namespace + the shared cluster Secret are created by the test driver; this file
+# defines node A (init with the shared secret, then serve) and node B (join A).
+# emptyDir volumes on purpose: wiping B's pod proves full backfill-on-rejoin.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shardscape-a
+  namespace: shardscape-2node
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: shardscape, site: site-a } }
+  template:
+    metadata:
+      labels: { app: shardscape, site: site-a }
+    spec:
+      initContainers:
+        - name: init
+          image: shardscape:2node
+          imagePullPolicy: Never
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              test -f /data/config.toml ||
+              /usr/local/bin/shardscape init --config /data/config.toml --data-dir /data
+              --cluster-secret "$CLUSTER_SECRET" --location-id site-a
+              --s3-addr 0.0.0.0:8014 --internal-addr 0.0.0.0:8015
+              --advertise http://shardscape-a.shardscape-2node.svc.cluster.local:8015
+          env:
+            - name: CLUSTER_SECRET
+              valueFrom: { secretKeyRef: { name: ss-cluster, key: secret } }
+          volumeMounts: [{ name: data, mountPath: /data }]
+      containers:
+        - name: shardscape
+          image: shardscape:2node
+          imagePullPolicy: Never
+          args: ["serve", "--config", "/data/config.toml"]
+          ports:
+            - { containerPort: 8014, name: s3 }
+            - { containerPort: 8015, name: internal }
+          volumeMounts: [{ name: data, mountPath: /data }]
+          readinessProbe: { tcpSocket: { port: s3 }, initialDelaySeconds: 2 }
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shardscape-a
+  namespace: shardscape-2node
+spec:
+  selector: { app: shardscape, site: site-a }
+  ports:
+    - { name: s3, port: 8014, targetPort: s3 }
+    - { name: internal, port: 8015, targetPort: internal }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shardscape-b
+  namespace: shardscape-2node
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: shardscape, site: site-b } }
+  template:
+    metadata:
+      labels: { app: shardscape, site: site-b }
+    spec:
+      containers:
+        - name: shardscape
+          image: shardscape:2node
+          imagePullPolicy: Never
+          # `join` creates this site's config (using the shared secret) on first
+          # boot, handshakes A, then serves. Crash-loops harmlessly until A is up.
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              /usr/local/bin/shardscape join
+              http://shardscape-a.shardscape-2node.svc.cluster.local:8015
+              --secret "$CLUSTER_SECRET" --config /data/config.toml --data-dir /data
+              --location-id site-b --s3-addr 0.0.0.0:8014 --internal-addr 0.0.0.0:8015
+              --advertise http://shardscape-b.shardscape-2node.svc.cluster.local:8015
+          env:
+            - name: CLUSTER_SECRET
+              valueFrom: { secretKeyRef: { name: ss-cluster, key: secret } }
+          ports:
+            - { containerPort: 8014, name: s3 }
+            - { containerPort: 8015, name: internal }
+          volumeMounts: [{ name: data, mountPath: /data }]
+          readinessProbe: { tcpSocket: { port: s3 }, initialDelaySeconds: 2 }
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shardscape-b
+  namespace: shardscape-2node
+spec:
+  selector: { app: shardscape, site: site-b }
+  ports:
+    - { name: s3, port: 8014, targetPort: s3 }
+    - { name: internal, port: 8015, targetPort: internal }

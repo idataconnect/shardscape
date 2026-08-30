@@ -1,0 +1,4 @@
+target/
+e2e/.venv/
+.git/
+__pycache__/

@@ -1,0 +1,36 @@
+[Unit]
+Description=Shardscape node (self-hosted multi-site S3 with global dedup)
+Documentation=https://github.com/idataconnect/shardscape
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated unprivileged user; create with: useradd --system --no-create-home shardscape
+User=shardscape
+Group=shardscape
+
+# systemd creates/owns /var/lib/shardscape for us. It holds config.toml, the
+# SQLite store (shardscape.db + WAL), and the blocks/ content-addressed store.
+StateDirectory=shardscape
+WorkingDirectory=/var/lib/shardscape
+
+# The binary is installed as `shardscape` (see deploy/BAREMETAL.md). Run init/join
+# once before first start to create /var/lib/shardscape/config.toml.
+ExecStart=/usr/local/bin/shardscape serve --config /var/lib/shardscape/config.toml
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the node needs only its data dir and the network.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/shardscape
+
+# Ports (informational): 8014 = S3 API (front with a TLS proxy if exposed),
+# 8015 = internal Noise cluster traffic (open between sites over the VPN).
+
+[Install]
+WantedBy=multi-user.target

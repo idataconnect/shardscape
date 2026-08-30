@@ -1,0 +1,40 @@
+[server]
+log_format = "text"
+s3_bind_addr = "0.0.0.0:8014"
+internal_bind_addr = "0.0.0.0:8015"
+advertise_addr = "http://localhost:8015"
+cluster_secret = "change-me"
+# noise_private_key is generated and persisted on first boot.
+
+[database]
+db_path = "shardscape.db"
+
+[storage]
+local_location_id = "site-a"
+gc_grace_period_seconds = 300
+gc_interval_seconds = 60
+
+# Refuse new writes once the data volume drops below this much free space, to
+# stay off the OS out-of-disk (ENOSPC) cliff. A tripped node still serves reads
+# and stays current on metadata; it just stops accepting new data and pulling
+# blocks until space frees (e.g. after GC), then catches up. Accepts "10Gi",
+# "500Mi", "1Ti", a plain byte count, or omit/"" to disable.
+min_free_bytes = "10Gi"
+
+# Hard cap on total block bytes stored locally. Writes and replication pulls are
+# refused once usage reaches this limit, until deletes or GC free space. Accepts
+# "500Gi", "1Ti", etc. Omit to disable (no cap).
+# max_bytes = "500Gi"
+
+# Block storage backend. Default: a local filesystem content-addressed store
+# (no external daemon). Switch type to "seaweed" with master_url/volume_url to
+# use an external SeaweedFS cluster instead.
+[storage.backend]
+type = "local"
+path = "blocks"
+
+[storage.chunking]
+type = "cdc"  # Options: "fixed", "cdc"
+min_block_size = 1048576  # 1MB
+avg_block_size = 4194304  # 4MB
+max_block_size = 10485760 # 10MB

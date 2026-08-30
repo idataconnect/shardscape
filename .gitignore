@@ -1,0 +1,4 @@
+/target/
+/e2e/.venv/
+__pycache__/
+*.pyc

@@ -1,0 +1,19 @@
+apiVersion: skaffold/v4beta11
+kind: Config
+metadata:
+  name: shardscape
+# Single-binary Shardscape: no ScyllaDB, no SeaweedFS, no Helm. Skaffold builds
+# the one image and applies the rendered manifest. The manifest is produced by
+# `shardscape render-k8s` (deploy/k8s/shardscape.yaml) — re-render from config,
+# never hand-edit.
+build:
+  artifacts:
+    - image: shardscape
+      context: .
+      docker:
+        dockerfile: Dockerfile
+manifests:
+  rawYaml:
+    - deploy/k8s/shardscape.yaml
+deploy:
+  kubectl: {}
