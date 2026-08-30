@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Self-hosted, multi-site, S3-compatible object store with global content-addressed deduplication"
 license = "Apache-2.0"
+repository = "https://github.com/idataconnect/shardscape"
 
 [dependencies]
 s3s = "0.11.1"
