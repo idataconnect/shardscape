@@ -114,6 +114,9 @@ mod tests {
         clock.set_offset(10_000); // +10 seconds
         let t1 = clock.now_micros();
         // t1 should be at least 9.9 s ahead of t0.
-        assert!(t1 - t0 >= 9_900_000, "offset change not reflected: t1={t1}, t0={t0}");
+        assert!(
+            t1 - t0 >= 9_900_000,
+            "offset change not reflected: t1={t1}, t0={t0}"
+        );
     }
 }

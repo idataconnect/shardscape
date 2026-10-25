@@ -20,13 +20,13 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::clock::ClusterClock;
-use crate::db::{Policy, ReplicationEntry, REPLICATION_STUCK_ATTEMPTS};
+use crate::db::{Policy, REPLICATION_STUCK_ATTEMPTS, ReplicationEntry};
 use crate::hashing::prefix_key_range;
 
 // Replication retry backoff: 1 minute base, doubling per attempt, capped at 6h.
@@ -256,8 +256,14 @@ impl Store {
         )?;
         // Best-effort migrations for stores created before these columns existed.
         // Pre-release, so a duplicate-column error just means we're already current.
-        let _ = conn.execute("ALTER TABLE objects ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0", []);
-        let _ = conn.execute("ALTER TABLE users ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE objects ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE users ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(())
     }
 
@@ -398,16 +404,23 @@ impl Store {
     }
 
     #[allow(dead_code)] // store_local_block is the live path; kept for direct location upserts
-    pub async fn add_block_location(&self, hash: &[u8], location_id: &str, fid: &[u8]) -> Result<()> {
+    pub async fn add_block_location(
+        &self,
+        hash: &[u8],
+        location_id: &str,
+        fid: &[u8],
+    ) -> Result<()> {
         let ts = self.now_micros();
         let conn = self.conn.lock().unwrap();
         // size unknown here; preserve any existing size, else 0. The block row is
         // created by whoever first knows the size; a location-only announce keeps
         // it untouched if present.
         let size: i64 = conn
-            .query_row("SELECT size FROM blocks WHERE hash = ?1", params![hash], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT size FROM blocks WHERE hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
             .optional()?
             .unwrap_or(0);
         Self::upsert_block_location(&conn, hash, location_id, fid, size, ts)
@@ -481,7 +494,16 @@ impl Store {
                 shard_id = excluded.shard_id, updated_at = excluded.updated_at,
                 deleted = excluded.deleted
              WHERE excluded.updated_at > objects.updated_at",
-            params![bucket, key, encoded_blocks, size, etag, shard_id, ts, deleted as i64],
+            params![
+                bucket,
+                key,
+                encoded_blocks,
+                size,
+                etag,
+                shard_id,
+                ts,
+                deleted as i64
+            ],
         )?;
         Ok(())
     }
@@ -649,8 +671,7 @@ impl Store {
     /// Hashes of blocks physically held at this site.
     pub async fn list_local_block_hashes(&self) -> Result<Vec<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT hash FROM block_locations WHERE location_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT hash FROM block_locations WHERE location_id = ?1")?;
         let rows = stmt.query_map(params![self.local_location_id], |r| r.get::<_, Vec<u8>>(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -671,15 +692,16 @@ impl Store {
     pub async fn get_pending_deletions(&self) -> Result<Vec<(Vec<u8>, i64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT hash, not_before FROM pending_deletions")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub async fn remove_pending_deletion(&self, hash: &[u8]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM pending_deletions WHERE hash = ?1", params![hash])?;
+        conn.execute(
+            "DELETE FROM pending_deletions WHERE hash = ?1",
+            params![hash],
+        )?;
         Ok(())
     }
 
@@ -760,7 +782,14 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(bucket, upload_id, part_number) DO UPDATE SET
                 blocks = excluded.blocks, size = excluded.size, etag = excluded.etag",
-            params![bucket, upload_id.to_string(), part_number, encoded, size, etag],
+            params![
+                bucket,
+                upload_id.to_string(),
+                part_number,
+                encoded,
+                size,
+                etag
+            ],
         )?;
         Ok(())
     }
@@ -799,10 +828,10 @@ impl Store {
         max_uploads: usize,
     ) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
-        let mut query = String::from(
-            "SELECT key, upload_id FROM multipart_uploads WHERE bucket = ?1",
-        );
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(bucket.to_string())];
+        let mut query =
+            String::from("SELECT key, upload_id FROM multipart_uploads WHERE bucket = ?1");
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(bucket.to_string())];
         let mut idx = 2;
 
         if let Some(pfx) = prefix {
@@ -819,7 +848,8 @@ impl Store {
         query.push_str(" ORDER BY key ASC, upload_id ASC LIMIT ?");
         param_values.push(Box::new((max_uploads + 1) as i64));
 
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(params_ref.as_slice(), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -877,9 +907,7 @@ impl Store {
     pub async fn all_nodes(&self) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT location_id, api_url FROM nodes")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -993,7 +1021,11 @@ impl Store {
             "SELECT seq, ts, payload FROM fact_log WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![after, limit], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -1037,7 +1069,13 @@ impl Store {
     pub async fn apply_fact(&self, rec: &FactRecord) -> Result<()> {
         let ts = rec.ts;
         match &rec.fact {
-            Fact::ObjectPut { bucket, key, blocks, size, etag } => {
+            Fact::ObjectPut {
+                bucket,
+                key,
+                blocks,
+                size,
+                etag,
+            } => {
                 let decoded: Vec<Vec<u8>> = blocks
                     .iter()
                     .map(|h| hex::decode(h))
@@ -1045,14 +1083,21 @@ impl Store {
                 let encoded = Self::encode_blocks(&decoded);
                 let shard_id = crate::hashing::compute_shard_id(key);
                 let conn = self.conn.lock().unwrap();
-                Self::put_object_row(&conn, bucket, key, &encoded, *size, etag, shard_id, false, ts)?;
+                Self::put_object_row(
+                    &conn, bucket, key, &encoded, *size, etag, shard_id, false, ts,
+                )?;
             }
             Fact::ObjectDelete { bucket, key } => {
                 let shard_id = crate::hashing::compute_shard_id(key);
                 let conn = self.conn.lock().unwrap();
                 Self::put_object_row(&conn, bucket, key, &[], 0, "", shard_id, true, ts)?;
             }
-            Fact::BlockAnnounce { hash, location_id, fid, size } => {
+            Fact::BlockAnnounce {
+                hash,
+                location_id,
+                fid,
+                size,
+            } => {
                 let hash_b = hex::decode(hash)?;
                 let fid_b = hex::decode(fid)?;
                 let need_pull = {
@@ -1068,11 +1113,18 @@ impl Store {
                     have_local.is_none() && location_id != &self.local_location_id
                 };
                 if need_pull {
-                    self.enqueue_replication(&hash_b, std::slice::from_ref(&self.local_location_id))
-                        .await?;
+                    self.enqueue_replication(
+                        &hash_b,
+                        std::slice::from_ref(&self.local_location_id),
+                    )
+                    .await?;
                 }
             }
-            Fact::UserPut { access_key, secret_key, policy } => {
+            Fact::UserPut {
+                access_key,
+                secret_key,
+                policy,
+            } => {
                 let policy_json = serde_json::to_string(policy)?;
                 let conn = self.conn.lock().unwrap();
                 Self::put_user_row(&conn, access_key, secret_key, &policy_json, ts)?;
@@ -1102,14 +1154,22 @@ impl Store {
     pub async fn stats(&self) -> Result<StoreStats> {
         let conn = self.conn.lock().unwrap();
         Ok(StoreStats {
-            live_objects: conn.query_row("SELECT COUNT(*) FROM objects WHERE deleted = 0", [], |r| r.get(0))?,
+            live_objects: conn.query_row(
+                "SELECT COUNT(*) FROM objects WHERE deleted = 0",
+                [],
+                |r| r.get(0),
+            )?,
             local_blocks: conn.query_row(
                 "SELECT COUNT(*) FROM block_locations WHERE location_id = ?1",
                 params![self.local_location_id],
                 |r| r.get(0),
             )?,
             local_block_bytes: Self::local_block_bytes_locked(&conn, &self.local_location_id)?,
-            pending_deletions: conn.query_row("SELECT COUNT(*) FROM pending_deletions", [], |r| r.get(0))?,
+            pending_deletions: conn.query_row(
+                "SELECT COUNT(*) FROM pending_deletions",
+                [],
+                |r| r.get(0),
+            )?,
             fact_count: conn.query_row("SELECT COUNT(*) FROM fact_log", [], |r| r.get(0))?,
             pending_pulls: conn.query_row(
                 "SELECT COUNT(*) FROM replication_queue WHERE target_location_id = ?1",
@@ -1121,7 +1181,12 @@ impl Store {
 
     // ── users ────────────────────────────────────────────────────────────────
 
-    pub async fn create_user(&self, access_key: &str, secret_key: &str, policy: &Policy) -> Result<()> {
+    pub async fn create_user(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        policy: &Policy,
+    ) -> Result<()> {
         let ts = self.now_micros();
         let policy_value = serde_json::to_value(policy)?;
         let policy_json = serde_json::to_string(policy)?;
@@ -1218,7 +1283,9 @@ mod tests {
         let b = store_with("site-b", 0).await;
 
         // A put propagates to B.
-        a.insert_object("bk", 0, "k", vec![h(1), h(2)], 99, "e1").await.unwrap();
+        a.insert_object("bk", 0, "k", vec![h(1), h(2)], 99, "e1")
+            .await
+            .unwrap();
         pump(&a, &b).await;
         let got = b.get_object("bk", "k").await.unwrap().unwrap();
         assert_eq!(got.0, vec![h(1), h(2)]);
@@ -1241,8 +1308,12 @@ mod tests {
         let a = store_with("site-a", 0).await;
         let b = store_with("site-b", 60_000).await;
 
-        a.insert_object("bk", 0, "k", vec![h(1)], 1, "from-a").await.unwrap();
-        b.insert_object("bk", 0, "k", vec![h(2)], 2, "from-b").await.unwrap();
+        a.insert_object("bk", 0, "k", vec![h(1)], 1, "from-a")
+            .await
+            .unwrap();
+        b.insert_object("bk", 0, "k", vec![h(2)], 2, "from-b")
+            .await
+            .unwrap();
 
         // Exchange both ways; both must converge to B's (newer) value.
         pump(&a, &b).await;
@@ -1257,7 +1328,9 @@ mod tests {
         let a = store_with("site-a", 60_000).await;
         let b = store_with("site-b", 0).await;
 
-        b.insert_object("bk", 0, "k", vec![h(1)], 1, "older").await.unwrap();
+        b.insert_object("bk", 0, "k", vec![h(1)], 1, "older")
+            .await
+            .unwrap();
         a.delete_object("bk", "k").await.unwrap();
 
         pump(&b, &a).await; // a sees b's older put — loses to the tombstone
@@ -1292,14 +1365,18 @@ mod tests {
     async fn object_round_trip_and_lww() {
         let s = store().await;
         let blocks = vec![h(1), h(2)];
-        s.insert_object("b", 0, "k", blocks.clone(), 100, "etag1").await.unwrap();
+        s.insert_object("b", 0, "k", blocks.clone(), 100, "etag1")
+            .await
+            .unwrap();
         let got = s.get_object("b", "k").await.unwrap().unwrap();
         assert_eq!(got.0, blocks);
         assert_eq!(got.1, 100);
         assert_eq!(got.2, "etag1");
 
         // A newer write wins; the manifest and etag update.
-        s.insert_object("b", 0, "k", vec![h(3)], 50, "etag2").await.unwrap();
+        s.insert_object("b", 0, "k", vec![h(3)], 50, "etag2")
+            .await
+            .unwrap();
         let got = s.get_object("b", "k").await.unwrap().unwrap();
         assert_eq!(got.0, vec![h(3)]);
         assert_eq!(got.2, "etag2");
@@ -1308,7 +1385,9 @@ mod tests {
     #[tokio::test]
     async fn delete_object_removes_it() {
         let s = store().await;
-        s.insert_object("b", 0, "k", vec![h(1)], 1, "e").await.unwrap();
+        s.insert_object("b", 0, "k", vec![h(1)], 1, "e")
+            .await
+            .unwrap();
         s.delete_object("b", "k").await.unwrap();
         assert!(s.get_object("b", "k").await.unwrap().is_none());
     }
@@ -1317,7 +1396,9 @@ mod tests {
     async fn list_is_globally_sorted_and_paginates() {
         let s = store().await;
         for key in ["c", "a", "b", "e", "d"] {
-            s.insert_object("b", 0, key, vec![h(1)], 1, "e").await.unwrap();
+            s.insert_object("b", 0, key, vec![h(1)], 1, "e")
+                .await
+                .unwrap();
         }
         let (page, truncated) = s.list_objects("b", None, None, 3).await.unwrap();
         let keys: Vec<_> = page.iter().map(|(k, _, _)| k.clone()).collect();
@@ -1334,7 +1415,9 @@ mod tests {
     async fn list_prefix_filters() {
         let s = store().await;
         for key in ["app/1", "app/2", "zoo/1"] {
-            s.insert_object("b", 0, key, vec![h(1)], 1, "e").await.unwrap();
+            s.insert_object("b", 0, key, vec![h(1)], 1, "e")
+                .await
+                .unwrap();
         }
         let (page, _) = s.list_objects("b", None, Some("app/"), 10).await.unwrap();
         let keys: Vec<_> = page.iter().map(|(k, _, _)| k.clone()).collect();
@@ -1352,7 +1435,9 @@ mod tests {
         assert!(s.compute_live_block_set().await.unwrap().is_empty());
 
         // An object referencing h(1) puts it in the live set; h(2) stays orphan.
-        s.insert_object("b", 0, "k", vec![h(1)], 10, "e").await.unwrap();
+        s.insert_object("b", 0, "k", vec![h(1)], 10, "e")
+            .await
+            .unwrap();
         let live = s.compute_live_block_set().await.unwrap();
         assert!(live.contains(&h(1)));
         assert!(!live.contains(&h(2)));
@@ -1367,7 +1452,9 @@ mod tests {
         let s = store().await;
         s.store_local_block(&h(1), b"3,01", 10).await.unwrap();
         // A peer also holds it → not the last copy: row survives.
-        s.add_block_location(&h(1), "site-b", b"9,xx").await.unwrap();
+        s.add_block_location(&h(1), "site-b", b"9,xx")
+            .await
+            .unwrap();
         assert!(s.delete_local_block(&h(1)).await.unwrap());
         assert!(s.get_local_block_fid(&h(1)).await.unwrap().is_none());
         assert!(s.get_block_fids(&h(1)).await.unwrap().is_some()); // site-b entry remains
@@ -1382,9 +1469,13 @@ mod tests {
     #[tokio::test]
     async fn replication_queue_drain_for_local_target() {
         let clock = Arc::new(ClusterClock::new(0));
-        let s = Store::new(":memory:", "site-b".to_string(), clock).await.unwrap();
+        let s = Store::new(":memory:", "site-b".to_string(), clock)
+            .await
+            .unwrap();
         // site-a wrote a block targeting site-b; here we ARE site-b, enqueue to self.
-        s.enqueue_replication(&h(7), &["site-b".to_string()]).await.unwrap();
+        s.enqueue_replication(&h(7), &["site-b".to_string()])
+            .await
+            .unwrap();
         let q = s.get_replication_queue().await.unwrap();
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].hash, h(7));
@@ -1394,7 +1485,9 @@ mod tests {
         assert!(s.get_replication_queue().await.unwrap().is_empty());
 
         // Dequeue removes it entirely.
-        s.enqueue_replication(&h(8), &["site-b".to_string()]).await.unwrap();
+        s.enqueue_replication(&h(8), &["site-b".to_string()])
+            .await
+            .unwrap();
         s.dequeue_replication(&h(8), 0).await.unwrap();
         let remaining: Vec<_> = s.get_replication_queue().await.unwrap();
         assert!(remaining.iter().all(|e| e.hash != h(8)));
@@ -1426,12 +1519,18 @@ mod tests {
         s.record_peer("site-a", "http://evil:9999").await.unwrap();
 
         let peers = s.get_peers_with_urls().await.unwrap();
-        assert_eq!(peers.get("site-b").map(|s| s.as_str()), Some("http://b:8015"));
+        assert_eq!(
+            peers.get("site-b").map(|s| s.as_str()),
+            Some("http://b:8015")
+        );
         assert!(!peers.contains_key("site-a"), "self excluded from peers");
 
         // all_nodes includes self.
         let all = s.all_nodes().await.unwrap();
-        assert!(all.iter().any(|(id, url)| id == "site-a" && url == "http://a:8015"));
+        assert!(
+            all.iter()
+                .any(|(id, url)| id == "site-a" && url == "http://a:8015")
+        );
         assert!(all.iter().any(|(id, _)| id == "site-b"));
     }
 
@@ -1448,24 +1547,51 @@ mod tests {
         let upload_id = Uuid::new_v4();
 
         // create → get key (this call is what overflowed before the fix).
-        ObjectStore::create_multipart_upload(&s, "test", "big.bin", upload_id).await.unwrap();
-        let key = ObjectStore::get_multipart_upload_key(&s, "test", upload_id).await.unwrap();
+        ObjectStore::create_multipart_upload(&s, "test", "big.bin", upload_id)
+            .await
+            .unwrap();
+        let key = ObjectStore::get_multipart_upload_key(&s, "test", upload_id)
+            .await
+            .unwrap();
         assert_eq!(key.as_deref(), Some("big.bin"));
 
         // Unknown upload id yields None rather than an error.
-        assert!(ObjectStore::get_multipart_upload_key(&s, "test", Uuid::new_v4()).await.unwrap().is_none());
+        assert!(
+            ObjectStore::get_multipart_upload_key(&s, "test", Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Parts round-trip through the trait surface too.
-        ObjectStore::insert_part(&s, "test", upload_id, 1, vec![vec![1u8; 32]], 32, "e1").await.unwrap();
-        ObjectStore::insert_part(&s, "test", upload_id, 2, vec![vec![2u8; 32]], 32, "e2").await.unwrap();
-        let parts = ObjectStore::list_parts(&s, "test", upload_id).await.unwrap();
+        ObjectStore::insert_part(&s, "test", upload_id, 1, vec![vec![1u8; 32]], 32, "e1")
+            .await
+            .unwrap();
+        ObjectStore::insert_part(&s, "test", upload_id, 2, vec![vec![2u8; 32]], 32, "e2")
+            .await
+            .unwrap();
+        let parts = ObjectStore::list_parts(&s, "test", upload_id)
+            .await
+            .unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].0, 1);
         assert_eq!(parts[1].0, 2);
 
         // Abort/complete cleanup removes the upload and its parts.
-        ObjectStore::delete_multipart_upload(&s, "test", upload_id).await.unwrap();
-        assert!(ObjectStore::get_multipart_upload_key(&s, "test", upload_id).await.unwrap().is_none());
-        assert!(ObjectStore::list_parts(&s, "test", upload_id).await.unwrap().is_empty());
+        ObjectStore::delete_multipart_upload(&s, "test", upload_id)
+            .await
+            .unwrap();
+        assert!(
+            ObjectStore::get_multipart_upload_key(&s, "test", upload_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ObjectStore::list_parts(&s, "test", upload_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

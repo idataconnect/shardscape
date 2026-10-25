@@ -110,9 +110,18 @@ mod tests {
 
     #[test]
     fn wildcard_arn_prefix() {
-        assert!(wildcard_match("arn:ss:bucket:::my-bucket*", "arn:ss:bucket:::my-bucket/key"));
-        assert!(wildcard_match("arn:ss:bucket:::my-bucket*", "arn:ss:bucket:::my-bucket"));
-        assert!(!wildcard_match("arn:ss:bucket:::my-bucket*", "arn:ss:bucket:::other-bucket"));
+        assert!(wildcard_match(
+            "arn:ss:bucket:::my-bucket*",
+            "arn:ss:bucket:::my-bucket/key"
+        ));
+        assert!(wildcard_match(
+            "arn:ss:bucket:::my-bucket*",
+            "arn:ss:bucket:::my-bucket"
+        ));
+        assert!(!wildcard_match(
+            "arn:ss:bucket:::my-bucket*",
+            "arn:ss:bucket:::other-bucket"
+        ));
     }
 
     #[test]
@@ -139,19 +148,31 @@ mod tests {
 
     #[test]
     fn statement_matches_exact_action_and_resource() {
-        let s = stmt("Allow", &["s3:GetObject"], &["arn:ss:bucket:::my-bucket/key"]);
+        let s = stmt(
+            "Allow",
+            &["s3:GetObject"],
+            &["arn:ss:bucket:::my-bucket/key"],
+        );
         assert!(s.matches("s3:GetObject", "arn:ss:bucket:::my-bucket/key"));
     }
 
     #[test]
     fn statement_does_not_match_wrong_action() {
-        let s = stmt("Allow", &["s3:GetObject"], &["arn:ss:bucket:::my-bucket/key"]);
+        let s = stmt(
+            "Allow",
+            &["s3:GetObject"],
+            &["arn:ss:bucket:::my-bucket/key"],
+        );
         assert!(!s.matches("s3:PutObject", "arn:ss:bucket:::my-bucket/key"));
     }
 
     #[test]
     fn statement_does_not_match_wrong_resource() {
-        let s = stmt("Allow", &["s3:GetObject"], &["arn:ss:bucket:::my-bucket/key"]);
+        let s = stmt(
+            "Allow",
+            &["s3:GetObject"],
+            &["arn:ss:bucket:::my-bucket/key"],
+        );
         assert!(!s.matches("s3:GetObject", "arn:ss:bucket:::other-bucket/key"));
     }
 
@@ -179,11 +200,15 @@ mod tests {
     // ── Policy::is_allowed ────────────────────────────────────────────────────
 
     fn allow_all() -> Policy {
-        Policy { statements: vec![stmt("Allow", &["*"], &["*"])] }
+        Policy {
+            statements: vec![stmt("Allow", &["*"], &["*"])],
+        }
     }
 
     fn deny_all() -> Policy {
-        Policy { statements: vec![stmt("Deny", &["*"], &["*"])] }
+        Policy {
+            statements: vec![stmt("Deny", &["*"], &["*"])],
+        }
     }
 
     #[test]
@@ -256,7 +281,11 @@ mod tests {
     fn policy_json_round_trip() {
         let original = Policy {
             statements: vec![
-                stmt("Allow", &["s3:GetObject", "s3:ListBucket"], &["arn:ss:bucket:::my-bucket*"]),
+                stmt(
+                    "Allow",
+                    &["s3:GetObject", "s3:ListBucket"],
+                    &["arn:ss:bucket:::my-bucket*"],
+                ),
                 stmt("Deny", &["s3:DeleteObject"], &["*"]),
             ],
         };

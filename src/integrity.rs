@@ -110,11 +110,13 @@ impl Algo {
     }
 
     fn from_name(name: &str) -> Option<Algo> {
-        ALL.into_iter().find(|a| a.name().eq_ignore_ascii_case(name))
+        ALL.into_iter()
+            .find(|a| a.name().eq_ignore_ascii_case(name))
     }
 
     fn from_header(name: &str) -> Option<Algo> {
-        ALL.into_iter().find(|a| a.header().eq_ignore_ascii_case(name))
+        ALL.into_iter()
+            .find(|a| a.header().eq_ignore_ascii_case(name))
     }
 }
 
@@ -198,10 +200,14 @@ impl BodyVerifier {
             if from_trailer.is_none() && self.trailed.contains(&algo) {
                 return Err(S3Error::with_message(
                     S3ErrorCode::IncompleteBody,
-                    format!("The request declared trailer {} but did not send it.", algo.header()),
+                    format!(
+                        "The request declared trailer {} but did not send it.",
+                        algo.header()
+                    ),
                 ));
             }
-            let Some(sent) = from_trailer.or_else(|| algo.field(&self.expected.headers).cloned()) else {
+            let Some(sent) = from_trailer.or_else(|| algo.field(&self.expected.headers).cloned())
+            else {
                 continue;
             };
             let ok = match algo.field(&computed) {
@@ -213,7 +219,10 @@ impl BodyVerifier {
             if !ok {
                 return Err(S3Error::with_message(
                     S3ErrorCode::BadDigest,
-                    format!("The {} you specified did not match the calculated checksum.", algo.name()),
+                    format!(
+                        "The {} you specified did not match the calculated checksum.",
+                        algo.name()
+                    ),
                 ));
             }
         }
@@ -225,8 +234,8 @@ impl BodyVerifier {
 mod tests {
     use super::*;
     use hyper::header::HeaderValue;
-    use s3s::crypto::Checksum as _;
     use md5::{Digest, Md5};
+    use s3s::crypto::Checksum as _;
 
     fn md5_of(data: &[u8]) -> Vec<u8> {
         Md5::digest(data).to_vec()
@@ -253,7 +262,10 @@ mod tests {
     #[test]
     fn header_checksum_match_and_mismatch() {
         let good = Expected {
-            headers: Checksum { checksum_crc32c: Some(crc32c_b64(b"hello")), ..Default::default() },
+            headers: Checksum {
+                checksum_crc32c: Some(crc32c_b64(b"hello")),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut v = BodyVerifier::new(&HeaderMap::new(), good);
@@ -262,7 +274,10 @@ mod tests {
         assert_eq!(c.checksum_crc32c, Some(crc32c_b64(b"hello")));
 
         let bad = Expected {
-            headers: Checksum { checksum_crc32c: Some(crc32c_b64(b"other")), ..Default::default() },
+            headers: Checksum {
+                checksum_crc32c: Some(crc32c_b64(b"other")),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut v = BodyVerifier::new(&HeaderMap::new(), bad);
@@ -275,7 +290,10 @@ mod tests {
     fn trailer_checksum_is_verified() {
         let req = trailer_headers("x-amz-checksum-crc32c");
         let mut trailers = HeaderMap::new();
-        trailers.insert("x-amz-checksum-crc32c", HeaderValue::from_str(&crc32c_b64(b"abc")).unwrap());
+        trailers.insert(
+            "x-amz-checksum-crc32c",
+            HeaderValue::from_str(&crc32c_b64(b"abc")).unwrap(),
+        );
 
         let mut v = BodyVerifier::new(&req, Expected::default());
         v.update(b"abc");
@@ -298,7 +316,10 @@ mod tests {
 
     #[test]
     fn content_md5_mismatch_is_bad_digest() {
-        let e = Expected { content_md5: Some(BASE64.encode(md5_of(b"x"))), ..Default::default() };
+        let e = Expected {
+            content_md5: Some(BASE64.encode(md5_of(b"x"))),
+            ..Default::default()
+        };
         let mut v = BodyVerifier::new(&HeaderMap::new(), e);
         v.update(b"y");
         let err = v.finish(None, &md5_of(b"y")).unwrap_err();
@@ -320,7 +341,8 @@ mod tests {
             trailers.insert(algo.header(), HeaderValue::from_str(&want).unwrap());
             let mut v = BodyVerifier::new(&req, Expected::default());
             v.update(data);
-            v.finish(Some(&trailers), &md5_of(data)).unwrap_or_else(|e| panic!("{algo:?}: {e}"));
+            v.finish(Some(&trailers), &md5_of(data))
+                .unwrap_or_else(|e| panic!("{algo:?}: {e}"));
         }
     }
 }

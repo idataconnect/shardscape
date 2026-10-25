@@ -222,7 +222,9 @@ mod tests {
         let s = cdc();
         let mut buf = make_buf(&[0xCD; 100]);
         s.process(&mut buf);
-        let tail = s.finalize(&mut buf).expect("finalize should return remainder");
+        let tail = s
+            .finalize(&mut buf)
+            .expect("finalize should return remainder");
         assert_eq!(tail.len(), 100);
     }
 
@@ -266,15 +268,22 @@ mod tests {
 
         let mut buf1 = BytesMut::from(data.as_slice());
         let mut c1 = s.process(&mut buf1);
-        if let Some(t) = s.finalize(&mut buf1) { c1.push(t); }
+        if let Some(t) = s.finalize(&mut buf1) {
+            c1.push(t);
+        }
 
         let mut buf2 = BytesMut::from(data.as_slice());
         let mut c2 = s.process(&mut buf2);
-        if let Some(t) = s.finalize(&mut buf2) { c2.push(t); }
+        if let Some(t) = s.finalize(&mut buf2) {
+            c2.push(t);
+        }
 
         assert_eq!(c1.len(), c2.len(), "chunk count must be deterministic");
         for (a, b) in c1.iter().zip(c2.iter()) {
-            assert_eq!(a, b, "chunk boundaries must be identical for identical input");
+            assert_eq!(
+                a, b,
+                "chunk boundaries must be identical for identical input"
+            );
         }
     }
 }

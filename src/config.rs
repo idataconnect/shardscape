@@ -1,7 +1,7 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use anyhow::{Context, Result};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -73,16 +73,16 @@ pub enum BlockBackend {
 }
 
 fn default_block_backend() -> BlockBackend {
-    BlockBackend::Local { path: "blocks".to_string() }
+    BlockBackend::Local {
+        path: "blocks".to_string(),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum ChunkingConfig {
     #[serde(rename = "fixed")]
-    Fixed {
-        max_block_size: usize,
-    },
+    Fixed { max_block_size: usize },
     #[serde(rename = "cdc")]
     Cdc {
         min_block_size: usize,

@@ -1,22 +1,18 @@
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use reqwest::Client;
-use s3s::{
-    dto::*,
-    S3Request, S3Response, S3Result, S3, S3Error, S3ErrorCode,
-    auth::*,
-};
-use std::sync::Arc;
 use futures_util::stream::StreamExt;
-use tracing::info;
-use http_body_util::StreamBody;
 use http_body::Frame;
+use http_body_util::StreamBody;
+use reqwest::Client;
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, auth::*, dto::*};
+use std::sync::Arc;
+use tracing::info;
 
-use md5::{Md5, Digest};
+use crate::chunking::ChunkingStrategy;
+use crate::config::Config;
 use crate::db::Db;
 use crate::hashing::compute_shard_id;
-use crate::config::Config;
-use crate::chunking::ChunkingStrategy;
+use md5::{Digest, Md5};
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
@@ -56,9 +52,18 @@ pub trait ObjectStore: Send + Sync {
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), anyhow::Error>;
 
-    async fn create_multipart_upload(&self, bucket: &str, key: &str, upload_id: uuid::Uuid) -> Result<(), anyhow::Error>;
+    async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<(), anyhow::Error>;
 
-    async fn get_multipart_upload_key(&self, bucket: &str, upload_id: uuid::Uuid) -> Result<Option<String>, anyhow::Error>;
+    async fn get_multipart_upload_key(
+        &self,
+        bucket: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<Option<String>, anyhow::Error>;
 
     async fn insert_part(
         &self,
@@ -70,9 +75,17 @@ pub trait ObjectStore: Send + Sync {
         etag: &str,
     ) -> Result<(), anyhow::Error>;
 
-    async fn list_parts(&self, bucket: &str, upload_id: uuid::Uuid) -> Result<Vec<(i32, Vec<Vec<u8>>, i64, String)>, anyhow::Error>;
+    async fn list_parts(
+        &self,
+        bucket: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<Vec<(i32, Vec<Vec<u8>>, i64, String)>, anyhow::Error>;
 
-    async fn delete_multipart_upload(&self, bucket: &str, upload_id: uuid::Uuid) -> Result<(), anyhow::Error>;
+    async fn delete_multipart_upload(
+        &self,
+        bucket: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<(), anyhow::Error>;
 
     async fn list_multipart_uploads(
         &self,
@@ -85,7 +98,12 @@ pub trait ObjectStore: Send + Sync {
 
 #[async_trait]
 pub trait BlockStore: Send + Sync {
-    async fn store_block(&self, block_data: Bytes, size: i64, ref_id: &str) -> Result<Vec<u8>, anyhow::Error>;
+    async fn store_block(
+        &self,
+        block_data: Bytes,
+        size: i64,
+        ref_id: &str,
+    ) -> Result<Vec<u8>, anyhow::Error>;
     async fn get_block(&self, hash: &[u8]) -> Result<Bytes, anyhow::Error>;
     async fn add_usage(&self, hash: &[u8], ref_id: &str) -> Result<(), anyhow::Error>;
     async fn remove_reference(&self, hash: &[u8], ref_id: &str) -> Result<(), anyhow::Error>;
@@ -189,7 +207,13 @@ struct SeaweedBlob {
 impl BlobStore for SeaweedBlob {
     async fn put(&self, _hash: &[u8], data: Bytes) -> Result<Vec<u8>, anyhow::Error> {
         let assign = format!("{}/dir/assign", self.master_url);
-        let res = self.client.get(&assign).send().await?.json::<serde_json::Value>().await?;
+        let res = self
+            .client
+            .get(&assign)
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
         let fid = res
             .get("fid")
             .and_then(|v| v.as_str())
@@ -233,7 +257,8 @@ impl ObjectStore for Db {
         size: i64,
         etag: &str,
     ) -> Result<(), anyhow::Error> {
-        self.insert_object(bucket, shard_id, key, blocks, size, etag).await
+        self.insert_object(bucket, shard_id, key, blocks, size, etag)
+            .await
     }
 
     async fn get_object(
@@ -259,14 +284,20 @@ impl ObjectStore for Db {
         prefix: Option<&str>,
         page_size: usize,
     ) -> Result<(Vec<(String, i64, String)>, bool), anyhow::Error> {
-        self.list_objects(bucket, start_after, prefix, page_size).await
+        self.list_objects(bucket, start_after, prefix, page_size)
+            .await
     }
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), anyhow::Error> {
         self.delete_object(bucket, key).await
     }
 
-    async fn create_multipart_upload(&self, bucket: &str, key: &str, upload_id: uuid::Uuid) -> Result<(), anyhow::Error> {
+    async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<(), anyhow::Error> {
         // The inherent method is named `insert_multipart` (args: bucket, upload_id,
         // key). Calling `self.create_multipart_upload(..)` here resolved back to
         // THIS trait method — unbounded async recursion that overflowed the stack
@@ -275,7 +306,11 @@ impl ObjectStore for Db {
         self.insert_multipart(bucket, upload_id, key).await
     }
 
-    async fn get_multipart_upload_key(&self, bucket: &str, upload_id: uuid::Uuid) -> Result<Option<String>, anyhow::Error> {
+    async fn get_multipart_upload_key(
+        &self,
+        bucket: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<Option<String>, anyhow::Error> {
         // Inherent method is `get_multipart_key`; same self-recursion bug as above.
         self.get_multipart_key(bucket, upload_id).await
     }
@@ -289,14 +324,23 @@ impl ObjectStore for Db {
         size: i64,
         etag: &str,
     ) -> Result<(), anyhow::Error> {
-        self.insert_part(bucket, upload_id, part_number, blocks, size, etag).await
+        self.insert_part(bucket, upload_id, part_number, blocks, size, etag)
+            .await
     }
 
-    async fn list_parts(&self, bucket: &str, upload_id: uuid::Uuid) -> Result<Vec<(i32, Vec<Vec<u8>>, i64, String)>, anyhow::Error> {
+    async fn list_parts(
+        &self,
+        bucket: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<Vec<(i32, Vec<Vec<u8>>, i64, String)>, anyhow::Error> {
         self.list_parts(bucket, upload_id).await
     }
 
-    async fn delete_multipart_upload(&self, bucket: &str, upload_id: uuid::Uuid) -> Result<(), anyhow::Error> {
+    async fn delete_multipart_upload(
+        &self,
+        bucket: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<(), anyhow::Error> {
         self.delete_multipart_upload(bucket, upload_id).await
     }
 
@@ -307,7 +351,8 @@ impl ObjectStore for Db {
         key_marker: Option<&str>,
         max_uploads: usize,
     ) -> Result<Vec<(String, String)>, anyhow::Error> {
-        self.list_multipart_uploads(bucket, prefix, key_marker, max_uploads).await
+        self.list_multipart_uploads(bucket, prefix, key_marker, max_uploads)
+            .await
     }
 }
 
@@ -322,14 +367,22 @@ impl DistributedBlockStore {
         let size = data.len() as i64;
         let fid = self.blob.put(hash, data).await?;
         self.db.store_local_block(hash, &fid, size).await?;
-        info!("Read-repair: promoted block {} to local storage", hex::encode(hash));
+        info!(
+            "Read-repair: promoted block {} to local storage",
+            hex::encode(hash)
+        );
         Ok(())
     }
 }
 
 #[async_trait]
 impl BlockStore for DistributedBlockStore {
-    async fn store_block(&self, block_data: Bytes, size: i64, _ref_id: &str) -> Result<Vec<u8>, anyhow::Error> {
+    async fn store_block(
+        &self,
+        block_data: Bytes,
+        size: i64,
+        _ref_id: &str,
+    ) -> Result<Vec<u8>, anyhow::Error> {
         let hash: Vec<u8> = blake3::hash(&block_data).as_bytes().to_vec();
 
         // No usage bookkeeping: a block is "referenced" iff a live manifest names
@@ -352,27 +405,45 @@ impl BlockStore for DistributedBlockStore {
         }
 
         // Cross-site fetch
-        let locations = self.db.get_block_fids(hash).await?
-            .ok_or_else(|| anyhow::anyhow!("Block {} not found in cluster", hex::encode(hash)))?;
+        let locations =
+            self.db.get_block_fids(hash).await?.ok_or_else(|| {
+                anyhow::anyhow!("Block {} not found in cluster", hex::encode(hash))
+            })?;
 
         let peers = self.db.get_peers_with_urls().await?;
         let any_holder_live = locations.keys().any(|loc| peers.contains_key(loc));
         for (peer_id, peer_url) in &peers {
             if locations.contains_key(peer_id) {
-                info!("Fetching block {} from remote site {}", hex::encode(hash), peer_id);
+                info!(
+                    "Fetching block {} from remote site {}",
+                    hex::encode(hash),
+                    peer_id
+                );
                 match self.noise_fetch_block(peer_url, hash).await {
                     Ok(data) => {
                         if let Err(e) = self.promote_block_locally(hash, data.clone()).await {
-                            tracing::warn!("Read-repair promotion failed for block {}: {}", hex::encode(hash), e);
+                            tracing::warn!(
+                                "Read-repair promotion failed for block {}: {}",
+                                hex::encode(hash),
+                                e
+                            );
                             // Don't leave the block remote-only: queue it so the
                             // replication drainer retries the promotion in the
                             // background instead of re-fetching cross-site on
                             // every future read.
-                            if let Err(qe) = self.db
-                                .enqueue_replication(hash, std::slice::from_ref(&self.db.local_location_id))
+                            if let Err(qe) = self
+                                .db
+                                .enqueue_replication(
+                                    hash,
+                                    std::slice::from_ref(&self.db.local_location_id),
+                                )
                                 .await
                             {
-                                tracing::warn!("Failed to re-queue block {} for replication: {}", hex::encode(hash), qe);
+                                tracing::warn!(
+                                    "Failed to re-queue block {} for replication: {}",
+                                    hex::encode(hash),
+                                    qe
+                                );
                             }
                         }
                         return Ok(data);
@@ -395,16 +466,21 @@ impl BlockStore for DistributedBlockStore {
         if any_holder_live {
             tracing::error!(
                 "Block {} unavailable: holder site(s) {:?} are live but every fetch failed (transient?)",
-                hex::encode(hash), holders
+                hex::encode(hash),
+                holders
             );
         } else {
             tracing::error!(
                 "Block {} unavailable: all holder site(s) {:?} are currently down. If this block was just \
                  written and never replicated, it may be permanently lost (single-site fast-PUT window).",
-                hex::encode(hash), holders
+                hex::encode(hash),
+                holders
             );
         }
-        Err(anyhow::anyhow!("Block {} missing at all reachable locations", hex::encode(hash)))
+        Err(anyhow::anyhow!(
+            "Block {} missing at all reachable locations",
+            hex::encode(hash)
+        ))
     }
 
     async fn add_usage(&self, _hash: &[u8], _ref_id: &str) -> Result<(), anyhow::Error> {
@@ -482,7 +558,13 @@ impl StorageBackend {
                 Some(&t) => t,
                 None => {
                     let _ = db
-                        .add_pending_deletion(hash, std::time::SystemTime::now() + std::time::Duration::from_secs(self.config.storage.gc_grace_period_seconds))
+                        .add_pending_deletion(
+                            hash,
+                            std::time::SystemTime::now()
+                                + std::time::Duration::from_secs(
+                                    self.config.storage.gc_grace_period_seconds,
+                                ),
+                        )
                         .await;
                     now + grace_ms
                 }
@@ -569,25 +651,30 @@ impl StorageBackend {
             // Decide, from metadata alone, what this entry needs before doing any
             // network I/O. The decision is a pure function so its branching is
             // unit-testable without a live DB or peers.
-            let candidates = match plan_replication(&entry, &locations, &db.local_location_id, &peers) {
-                ReplicationPlan::Drop => {
-                    // Block is gone globally, or we already hold it locally.
-                    db.dequeue_replication(hash, entry.next_attempt_at).await?;
-                    continue;
-                }
-                ReplicationPlan::Defer => {
-                    // No reachable source holds it; back off and retry later.
-                    self.defer_entry(db, &entry, "no reachable source holds the block").await;
-                    continue;
-                }
-                ReplicationPlan::FetchFrom(candidates) => candidates,
-            };
+            let candidates =
+                match plan_replication(&entry, &locations, &db.local_location_id, &peers) {
+                    ReplicationPlan::Drop => {
+                        // Block is gone globally, or we already hold it locally.
+                        db.dequeue_replication(hash, entry.next_attempt_at).await?;
+                        continue;
+                    }
+                    ReplicationPlan::Defer => {
+                        // No reachable source holds it; back off and retry later.
+                        self.defer_entry(db, &entry, "no reachable source holds the block")
+                            .await;
+                        continue;
+                    }
+                    ReplicationPlan::FetchFrom(candidates) => candidates,
+                };
 
             // Try each candidate source in turn until one yields the block.
             let mut fetched: Option<bytes::Bytes> = None;
             for (peer_id, peer_url) in &candidates {
                 match self.blocks.fetch_from_peer(peer_url, hash).await {
-                    Ok(data) => { fetched = Some(data); break; }
+                    Ok(data) => {
+                        fetched = Some(data);
+                        break;
+                    }
                     Err(e) => tracing::warn!("Replication fetch from {} failed: {}", peer_id, e),
                 }
             }
@@ -615,12 +702,17 @@ impl StorageBackend {
         // logs when something is actually stuck.
         match db.get_stuck_replications().await {
             Ok(stuck) if !stuck.is_empty() => {
-                let sample: Vec<String> = stuck.iter().take(5)
+                let sample: Vec<String> = stuck
+                    .iter()
+                    .take(5)
                     .map(|(h, a, _)| format!("{}(×{a})", hex::encode(h)))
                     .collect();
                 tracing::warn!(
                     "Replication: {} block(s) stuck (≥{} attempts) for site {}; sample: {}",
-                    stuck.len(), crate::db::REPLICATION_STUCK_ATTEMPTS, db.local_location_id, sample.join(", ")
+                    stuck.len(),
+                    crate::db::REPLICATION_STUCK_ATTEMPTS,
+                    db.local_location_id,
+                    sample.join(", ")
                 );
             }
             Ok(_) => {}
@@ -636,10 +728,16 @@ impl StorageBackend {
     async fn defer_entry(&self, db: &Db, entry: &crate::db::ReplicationEntry, reason: &str) {
         tracing::warn!(
             "Replication deferred for block {} (attempt {}): {}",
-            hex::encode(&entry.hash), entry.attempts + 1, reason
+            hex::encode(&entry.hash),
+            entry.attempts + 1,
+            reason
         );
         if let Err(de) = db.defer_replication(entry).await {
-            tracing::warn!("Failed to reschedule block {}: {}", hex::encode(&entry.hash), de);
+            tracing::warn!(
+                "Failed to reschedule block {}: {}",
+                hex::encode(&entry.hash),
+                de
+            );
         }
     }
 }
@@ -707,7 +805,11 @@ impl S3Auth for ShardscapeAuth {
 /// message from the response body. A 500 means the store failed, not the
 /// client, so the operator needs to see why — and the client only ever sees
 /// the XML. 4xx responses are the client's business and are not logged.
-pub async fn log_server_error(method: &hyper::Method, uri: &hyper::Uri, res: s3s::HttpResponse) -> s3s::HttpResponse {
+pub async fn log_server_error(
+    method: &hyper::Method,
+    uri: &hyper::Uri,
+    res: s3s::HttpResponse,
+) -> s3s::HttpResponse {
     if !res.status().is_server_error() {
         return res;
     }
@@ -747,9 +849,13 @@ impl DistributedBlockStore {
     /// replication-queue drainer processes entries sequentially in one task, a
     /// single hung fetch silently froze ALL replication (observed: 16h stall).
     /// On timeout we return an error so the normal defer/backoff path runs.
-    async fn noise_fetch_block(&self, peer_url: &str, hash: &[u8]) -> Result<bytes::Bytes, anyhow::Error> {
-        use hyper::Request;
+    async fn noise_fetch_block(
+        &self,
+        peer_url: &str,
+        hash: &[u8],
+    ) -> Result<bytes::Bytes, anyhow::Error> {
         use http_body_util::{BodyExt, Empty};
+        use hyper::Request;
         use tokio::net::TcpStream;
         use tokio::time::timeout;
 
@@ -760,20 +866,36 @@ impl DistributedBlockStore {
 
         let stream = timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(host_port))
             .await
-            .map_err(|_| anyhow::anyhow!("TCP connect to {host_port} timed out after {PEER_CONNECT_TIMEOUT:?}"))??;
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "TCP connect to {host_port} timed out after {PEER_CONNECT_TIMEOUT:?}"
+                )
+            })??;
         let noise_stream = timeout(
             PEER_CONNECT_TIMEOUT,
-            crate::noise_transport::NoiseStream::connect(stream, &self.noise_private_key, &self.noise_psk),
+            crate::noise_transport::NoiseStream::connect(
+                stream,
+                &self.noise_private_key,
+                &self.noise_psk,
+            ),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Noise handshake with {host_port} timed out after {PEER_CONNECT_TIMEOUT:?}"))??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Noise handshake with {host_port} timed out after {PEER_CONNECT_TIMEOUT:?}"
+            )
+        })??;
         let io = hyper_util::rt::TokioIo::new(noise_stream);
         let (mut sender, conn) = timeout(
             PEER_CONNECT_TIMEOUT,
             hyper::client::conn::http1::handshake::<_, Empty<bytes::Bytes>>(io),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("HTTP handshake with {host_port} timed out after {PEER_CONNECT_TIMEOUT:?}"))??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "HTTP handshake with {host_port} timed out after {PEER_CONNECT_TIMEOUT:?}"
+            )
+        })??;
         // Drive the connection in the background for the lifetime of this one
         // request. The task ends when `sender` is dropped at the end of this
         // function; we don't pool the connection, so no join handle is kept.
@@ -797,7 +919,9 @@ impl DistributedBlockStore {
             Ok::<_, anyhow::Error>(BodyExt::collect(res.into_body()).await?.to_bytes())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Block fetch from {host_port} timed out after {PEER_FETCH_TIMEOUT:?}"))??;
+        .map_err(|_| {
+            anyhow::anyhow!("Block fetch from {host_port} timed out after {PEER_FETCH_TIMEOUT:?}")
+        })??;
         Ok(data)
     }
 }
@@ -809,7 +933,13 @@ impl DistributedBlockStore {
 /// prefixes — the ListObjectsV2 delimiter semantics, factored out as a pure
 /// function so the grouping is unit-testable without a live store.
 impl StorageBackend {
-    async fn authorize<T>(&self, req: &S3Request<T>, action: &str, bucket: Option<&str>, key: Option<&str>) -> S3Result<()> {
+    async fn authorize<T>(
+        &self,
+        req: &S3Request<T>,
+        action: &str,
+        bucket: Option<&str>,
+        key: Option<&str>,
+    ) -> S3Result<()> {
         // When there is no backing DB (e.g. unit tests with mock stores), skip auth.
         let db = match self.db.as_ref() {
             Some(db) => db,
@@ -849,21 +979,23 @@ impl StorageBackend {
         // (see main). An empty/invalid key here means a real misconfiguration,
         // and silently substituting an all-zero key would only surface later as
         // an opaque handshake failure on the first cross-site fetch — so fail loudly.
-        let noise_private_key = crate::noise_transport::decode_private_key(&config.server.noise_private_key)
-            .expect("noise_private_key must be initialised before StorageBackend::new");
+        let noise_private_key =
+            crate::noise_transport::decode_private_key(&config.server.noise_private_key)
+                .expect("noise_private_key must be initialised before StorageBackend::new");
         let noise_psk = crate::noise_transport::derive_psk(&config.server.cluster_secret);
 
         let blob: Arc<dyn BlobStore> = match &config.storage.backend {
-            crate::config::BlockBackend::Local { path } => {
-                Arc::new(LocalBlob { root: std::path::PathBuf::from(path) })
-            }
-            crate::config::BlockBackend::Seaweed { master_url, volume_url } => {
-                Arc::new(SeaweedBlob {
-                    client: Client::new(),
-                    master_url: master_url.clone(),
-                    volume_url: volume_url.clone(),
-                })
-            }
+            crate::config::BlockBackend::Local { path } => Arc::new(LocalBlob {
+                root: std::path::PathBuf::from(path),
+            }),
+            crate::config::BlockBackend::Seaweed {
+                master_url,
+                volume_url,
+            } => Arc::new(SeaweedBlob {
+                client: Client::new(),
+                master_url: master_url.clone(),
+                volume_url: volume_url.clone(),
+            }),
         };
 
         let blocks = Arc::new(DistributedBlockStore {
@@ -875,13 +1007,15 @@ impl StorageBackend {
         }) as Arc<dyn BlockStore>;
 
         let chunker: Arc<dyn ChunkingStrategy> = match config.storage.chunking {
-            crate::config::ChunkingConfig::Cdc { min_block_size, avg_block_size, max_block_size } => {
-                Arc::new(crate::chunking::DynamicCDCStrategy {
-                    min_size: min_block_size,
-                    avg_size: avg_block_size,
-                    max_size: max_block_size,
-                })
-            }
+            crate::config::ChunkingConfig::Cdc {
+                min_block_size,
+                avg_block_size,
+                max_block_size,
+            } => Arc::new(crate::chunking::DynamicCDCStrategy {
+                min_size: min_block_size,
+                avg_size: avg_block_size,
+                max_size: max_block_size,
+            }),
             crate::config::ChunkingConfig::Fixed { max_block_size } => {
                 Arc::new(crate::chunking::FixedSizeStrategy {
                     chunk_size: max_block_size,
@@ -938,8 +1072,16 @@ impl StorageBackend {
             for block_data in self.chunker.process(&mut current_chunk) {
                 let len = block_data.len() as i64;
                 total_size += len;
-                let hash = self.blocks.store_block(block_data, len, ref_id).await
-                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("storing block: {e}")))?;
+                let hash = self
+                    .blocks
+                    .store_block(block_data, len, ref_id)
+                    .await
+                    .map_err(|e| {
+                        S3Error::with_message(
+                            S3ErrorCode::InternalError,
+                            format!("storing block: {e}"),
+                        )
+                    })?;
                 block_hashes.push(hash);
             }
         }
@@ -947,8 +1089,13 @@ impl StorageBackend {
         if let Some(block_data) = self.chunker.finalize(&mut current_chunk) {
             let len = block_data.len() as i64;
             total_size += len;
-            let hash = self.blocks.store_block(block_data, len, ref_id).await
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("storing block: {e}")))?;
+            let hash = self
+                .blocks
+                .store_block(block_data, len, ref_id)
+                .await
+                .map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("storing block: {e}"))
+                })?;
             block_hashes.push(hash);
         }
 
@@ -957,7 +1104,12 @@ impl StorageBackend {
         let trailers = trailers.and_then(|t| t.take());
         let checksum = verifier.finish(trailers.as_ref(), &md5)?;
 
-        Ok(Ingested { block_hashes, total_size, etag: hex::encode(md5), checksum })
+        Ok(Ingested {
+            block_hashes,
+            total_size,
+            etag: hex::encode(md5),
+            checksum,
+        })
     }
 
     /// Returns a 503 if the disk guard has tripped, so local S3 writes are
@@ -992,14 +1144,22 @@ impl StorageBackend {
         prefix: Option<&str>,
         delimiter: Option<&str>,
         max_keys: usize,
-    ) -> S3Result<(Vec<(String, i64, String)>, Vec<String>, bool, Option<String>)> {
+    ) -> S3Result<(
+        Vec<(String, i64, String)>,
+        Vec<String>,
+        bool,
+        Option<String>,
+    )> {
         match delimiter {
             // No delimiter: one page straight from the store (fast path).
             None => {
-                let (objects, is_truncated) = self.objects
+                let (objects, is_truncated) = self
+                    .objects
                     .list_objects(bucket, start_after, prefix, max_keys)
                     .await
-                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+                    .map_err(|e| {
+                        S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                    })?;
                 let next_token = if is_truncated {
                     objects.last().map(|(k, _, _)| k.clone())
                 } else {
@@ -1016,10 +1176,13 @@ impl StorageBackend {
                 let mut gathered: Vec<(String, i64, String)> = Vec::new();
                 let mut cursor = start_after.map(|s| s.to_string());
                 loop {
-                    let (page, more) = self.objects
+                    let (page, more) = self
+                        .objects
                         .list_objects(bucket, cursor.as_deref(), prefix, 1000)
                         .await
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+                        .map_err(|e| {
+                            S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                        })?;
                     let last = page.last().map(|(k, _, _)| k.clone());
                     gathered.extend(page);
                     match last {
@@ -1052,7 +1215,10 @@ fn group_by_delimiter(
         // store already filters), but if it did we keep it as a plain content.
         let rest = match key.strip_prefix(prefix) {
             Some(r) => r,
-            None => { contents.push((key, size, etag)); continue; }
+            None => {
+                contents.push((key, size, etag));
+                continue;
+            }
         };
         match rest.find(delimiter) {
             Some(idx) => {
@@ -1137,11 +1303,23 @@ fn merge_and_truncate(
     contents: Vec<(String, i64, String)>,
     common: Vec<String>,
     max_keys: usize,
-) -> (Vec<(String, i64, String)>, Vec<String>, bool, Option<String>) {
-    enum Item { Obj((String, i64, String)), Prefix(String) }
+) -> (
+    Vec<(String, i64, String)>,
+    Vec<String>,
+    bool,
+    Option<String>,
+) {
+    enum Item {
+        Obj((String, i64, String)),
+        Prefix(String),
+    }
     let mut merged: Vec<(String, Item)> = Vec::with_capacity(contents.len() + common.len());
-    for o in contents { merged.push((o.0.clone(), Item::Obj(o))); }
-    for p in common { merged.push((p.clone(), Item::Prefix(p))); }
+    for o in contents {
+        merged.push((o.0.clone(), Item::Obj(o)));
+    }
+    for p in common {
+        merged.push((p.clone(), Item::Prefix(p)));
+    }
     merged.sort_by(|a, b| a.0.cmp(&b.0));
 
     let is_truncated = merged.len() > max_keys;
@@ -1178,13 +1356,21 @@ struct Ingested {
 /// fault and get the 4xx S3 specifies; anything else (e.g. the connection
 /// dropping mid-upload) stays a 500 with the reason attached.
 fn body_read_error(e: s3s::StdError) -> S3Error {
-    if let Some(chunked) = e.downcast_ref::<s3s::stream::aws_chunked_stream::AwsChunkedStreamError>() {
-        return S3Error::with_message(chunked.to_s3_error_code(), format!("reading request body: {chunked}"));
+    if let Some(chunked) =
+        e.downcast_ref::<s3s::stream::aws_chunked_stream::AwsChunkedStreamError>()
+    {
+        return S3Error::with_message(
+            chunked.to_s3_error_code(),
+            format!("reading request body: {chunked}"),
+        );
     }
     if let Some(limit) = e.downcast_ref::<s3s::BodySizeLimitExceeded>() {
         return S3Error::with_message(S3ErrorCode::EntityTooLarge, limit.to_string());
     }
-    S3Error::with_message(S3ErrorCode::InternalError, format!("reading request body: {e}"))
+    S3Error::with_message(
+        S3ErrorCode::InternalError,
+        format!("reading request body: {e}"),
+    )
 }
 
 #[async_trait]
@@ -1193,7 +1379,13 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        self.authorize(&req, "s3:PutObject", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:PutObject",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         self.check_writable()?;
         let input = req.input;
         let bucket = input.bucket;
@@ -1217,12 +1409,23 @@ impl S3 for StorageBackend {
             algorithm: input.checksum_algorithm,
             content_md5: input.content_md5,
         };
-        let body = input.body.ok_or_else(|| {
-            S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing body")
-        })?;
+        let body = input
+            .body
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing body"))?;
         let ref_id = format!("obj:{}:{}", bucket, key);
-        let Ingested { block_hashes, total_size, etag, checksum } = self
-            .ingest_body(body, &ref_id, &req.headers, expected, req.trailing_headers.as_ref())
+        let Ingested {
+            block_hashes,
+            total_size,
+            etag,
+            checksum,
+        } = self
+            .ingest_body(
+                body,
+                &ref_id,
+                &req.headers,
+                expected,
+                req.trailing_headers.as_ref(),
+            )
             .await?;
 
         info!(bucket, key, shard_id, total_size, etag, "PutObject");
@@ -1235,10 +1438,12 @@ impl S3 for StorageBackend {
             }
         }
 
-        self.objects.insert_object(&bucket, shard_id, &key, block_hashes, total_size, &etag).await
+        self.objects
+            .insert_object(&bucket, shard_id, &key, block_hashes, total_size, &etag)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let output = PutObjectOutput{
+        let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(etag.to_string())),
             checksum_crc32: checksum.checksum_crc32,
             checksum_crc32c: checksum.checksum_crc32c,
@@ -1259,12 +1464,21 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        self.authorize(&req, "s3:GetObject", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:GetObject",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         let input = req.input;
         let bucket = input.bucket;
         let key = input.key;
 
-        let (blocks, size, etag) = self.objects.get_object(&bucket, &key).await
+        let (blocks, size, etag) = self
+            .objects
+            .get_object(&bucket, &key)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchKey, "Not found"))?;
 
@@ -1281,10 +1495,14 @@ impl S3 for StorageBackend {
             None => blocks.into_iter().map(|h| (h, 0u64, None)).collect(),
             Some(range) => {
                 let (start, end) = resolve_range(range, size as u64).ok_or_else(|| {
-                    S3Error::with_message(S3ErrorCode::InvalidRange, "Requested range not satisfiable")
+                    S3Error::with_message(
+                        S3ErrorCode::InvalidRange,
+                        "Requested range not satisfiable",
+                    )
                 })?;
-                let sizes = self.objects.block_sizes(&blocks).await
-                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+                let sizes = self.objects.block_sizes(&blocks).await.map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                })?;
                 content_length = (end - start + 1) as i64;
                 content_range = Some(format!("bytes {start}-{end}/{size}"));
                 slice_blocks_for_range(&sizes, start, end)
@@ -1321,9 +1539,13 @@ impl S3 for StorageBackend {
             .map(move |(hash_bytes, skip, take)| {
                 let store = Arc::clone(&blocks_store);
                 async move {
-                    store.get_block(&hash_bytes).await
+                    store
+                        .get_block(&hash_bytes)
+                        .await
                         .map(|data| Frame::data(slice_block_bytes(data, skip, take)))
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))
+                        .map_err(|e| {
+                            S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                        })
                 }
             })
             .buffered(2);
@@ -1332,7 +1554,7 @@ impl S3 for StorageBackend {
         let frame_stream = futures_util::stream::iter(first).chain(rest);
         let body = s3s::Body::http_body_unsync(StreamBody::new(frame_stream));
 
-        let output = GetObjectOutput{
+        let output = GetObjectOutput {
             body: Some(StreamingBlob::from(body)),
             content_length: Some(content_length),
             content_range,
@@ -1348,8 +1570,12 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        self.authorize(&req, "s3:ListAllMyBuckets", None, None).await?;
-        let names = self.objects.list_buckets().await
+        self.authorize(&req, "s3:ListAllMyBuckets", None, None)
+            .await?;
+        let names = self
+            .objects
+            .list_buckets()
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
         let buckets: Vec<Bucket> = names
             .into_iter()
@@ -1374,7 +1600,8 @@ impl S3 for StorageBackend {
         &self,
         _req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        self.authorize(&_req, "s3:CreateBucket", Some(&_req.input.bucket), None).await?;
+        self.authorize(&_req, "s3:CreateBucket", Some(&_req.input.bucket), None)
+            .await?;
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
 
@@ -1382,7 +1609,8 @@ impl S3 for StorageBackend {
         &self,
         _req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        self.authorize(&_req, "s3:DeleteBucket", Some(&_req.input.bucket), None).await?;
+        self.authorize(&_req, "s3:DeleteBucket", Some(&_req.input.bucket), None)
+            .await?;
         Ok(S3Response::new(DeleteBucketOutput::default()))
     }
 
@@ -1390,7 +1618,13 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        self.authorize(&req, "s3:DeleteObject", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:DeleteObject",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         let input = req.input;
 
         if let Ok(Some((blocks, _, _))) = self.objects.get_object(&input.bucket, &input.key).await {
@@ -1400,7 +1634,9 @@ impl S3 for StorageBackend {
             }
         }
 
-        self.objects.delete_object(&input.bucket, &input.key).await
+        self.objects
+            .delete_object(&input.bucket, &input.key)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }
@@ -1409,13 +1645,16 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        self.authorize(&req, "s3:DeleteObject", Some(&req.input.bucket), None).await?;
+        self.authorize(&req, "s3:DeleteObject", Some(&req.input.bucket), None)
+            .await?;
         let input = req.input;
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
 
         for object in input.delete.objects {
-            if let Ok(Some((blocks, _, _))) = self.objects.get_object(&input.bucket, &object.key).await {
+            if let Ok(Some((blocks, _, _))) =
+                self.objects.get_object(&input.bucket, &object.key).await
+            {
                 let ref_id = format!("obj:{}:{}", input.bucket, object.key);
                 for hash in blocks {
                     let _ = self.blocks.remove_reference(&hash, &ref_id).await;
@@ -1451,16 +1690,25 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        self.authorize(&req, "s3:HeadObject", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:HeadObject",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         let input = req.input;
         let bucket = input.bucket;
         let key = input.key;
 
-        let (_blocks, size, etag) = self.objects.get_object(&bucket, &key).await
+        let (_blocks, size, etag) = self
+            .objects
+            .get_object(&bucket, &key)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchKey, "Not found"))?;
 
-        let output = HeadObjectOutput{
+        let output = HeadObjectOutput {
             content_length: Some(size),
             e_tag: Some(ETag::Strong(etag.to_string())),
             last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
@@ -1473,29 +1721,31 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        self.authorize(&req, "s3:ListBucket", Some(&req.input.bucket), None).await?;
+        self.authorize(&req, "s3:ListBucket", Some(&req.input.bucket), None)
+            .await?;
         let input = req.input;
         let bucket = input.bucket;
         let prefix = input.prefix.as_deref();
         // continuation_token takes precedence over start_after per S3 spec.
-        let start_after = input.continuation_token.as_deref()
+        let start_after = input
+            .continuation_token
+            .as_deref()
             .or(input.start_after.as_deref());
         let max_keys = input.max_keys.unwrap_or(1000).max(1) as usize;
         let delimiter = input.delimiter.as_deref();
 
-        let (kept, common_prefixes, is_truncated, next_token) =
-            self.list_page(&bucket, start_after, prefix, delimiter, max_keys).await?;
+        let (kept, common_prefixes, is_truncated, next_token) = self
+            .list_page(&bucket, start_after, prefix, delimiter, max_keys)
+            .await?;
 
         let contents: Vec<Object> = kept
             .into_iter()
-            .map(|(key, size, etag)| {
-                Object{
-                    key: Some(key),
-                    size: Some(size),
-                    e_tag: Some(ETag::Strong(etag.to_string())),
-                    last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
-                    ..Default::default()
-                }
+            .map(|(key, size, etag)| Object {
+                key: Some(key),
+                size: Some(size),
+                e_tag: Some(ETag::Strong(etag.to_string())),
+                last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
+                ..Default::default()
             })
             .collect();
 
@@ -1506,12 +1756,16 @@ impl S3 for StorageBackend {
             .map(|p| CommonPrefix { prefix: Some(p) })
             .collect();
 
-        let output = ListObjectsV2Output{
+        let output = ListObjectsV2Output {
             name: Some(bucket),
             prefix: prefix.map(|p| p.to_string()),
             delimiter: delimiter.map(|d| d.to_string()),
             contents: Some(contents),
-            common_prefixes: if common_prefixes.is_empty() { None } else { Some(common_prefixes) },
+            common_prefixes: if common_prefixes.is_empty() {
+                None
+            } else {
+                Some(common_prefixes)
+            },
             is_truncated: Some(is_truncated),
             key_count: Some(key_count),
             max_keys: Some(max_keys as i32),
@@ -1525,7 +1779,8 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        self.authorize(&req, "s3:ListBucket", Some(&req.input.bucket), None).await?;
+        self.authorize(&req, "s3:ListBucket", Some(&req.input.bucket), None)
+            .await?;
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
@@ -1536,7 +1791,8 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
-        self.authorize(&req, "s3:ListBucketVersions", Some(&req.input.bucket), None).await?;
+        self.authorize(&req, "s3:ListBucketVersions", Some(&req.input.bucket), None)
+            .await?;
         let input = req.input;
         let bucket = input.bucket;
         let prefix = input.prefix.as_deref();
@@ -1544,8 +1800,9 @@ impl S3 for StorageBackend {
         let max_keys = input.max_keys.unwrap_or(1000).max(1) as usize;
         let delimiter = input.delimiter.as_deref();
 
-        let (kept, common_prefixes, is_truncated, next_marker) =
-            self.list_page(&bucket, key_marker, prefix, delimiter, max_keys).await?;
+        let (kept, common_prefixes, is_truncated, next_marker) = self
+            .list_page(&bucket, key_marker, prefix, delimiter, max_keys)
+            .await?;
 
         let versions: Vec<ObjectVersion> = kept
             .into_iter()
@@ -1570,10 +1827,18 @@ impl S3 for StorageBackend {
             delimiter: delimiter.map(|d| d.to_string()),
             key_marker: key_marker.map(|k| k.to_string()),
             versions: Some(versions),
-            common_prefixes: if common_prefixes.is_empty() { None } else { Some(common_prefixes) },
+            common_prefixes: if common_prefixes.is_empty() {
+                None
+            } else {
+                Some(common_prefixes)
+            },
             is_truncated: Some(is_truncated),
             next_key_marker: next_marker,
-            next_version_id_marker: if is_truncated { Some("null".to_string()) } else { None },
+            next_version_id_marker: if is_truncated {
+                Some("null".to_string())
+            } else {
+                None
+            },
             max_keys: Some(max_keys as i32),
             ..Default::default()
         };
@@ -1584,7 +1849,8 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
-        self.authorize(&req, "s3:ListBucket", Some(&req.input.bucket), None).await?;
+        self.authorize(&req, "s3:ListBucket", Some(&req.input.bucket), None)
+            .await?;
         let input = req.input;
         let bucket = input.bucket;
         let prefix = input.prefix.as_deref();
@@ -1594,10 +1860,13 @@ impl S3 for StorageBackend {
 
         let (kept, common_prefixes, is_truncated, next_marker) = match delimiter {
             None => {
-                let (objects, is_truncated) = self.objects
+                let (objects, is_truncated) = self
+                    .objects
                     .list_objects(&bucket, marker, prefix, max_keys)
                     .await
-                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+                    .map_err(|e| {
+                        S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                    })?;
                 let next_marker = if is_truncated {
                     objects.last().map(|(k, _, _)| k.clone())
                 } else {
@@ -1610,10 +1879,13 @@ impl S3 for StorageBackend {
                 let mut gathered: Vec<(String, i64, String)> = Vec::new();
                 let mut cursor = marker.map(|s| s.to_string());
                 loop {
-                    let (page, more) = self.objects
+                    let (page, more) = self
+                        .objects
                         .list_objects(&bucket, cursor.as_deref(), prefix, 1000)
                         .await
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+                        .map_err(|e| {
+                            S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                        })?;
                     let last = page.last().map(|(k, _, _)| k.clone());
                     gathered.extend(page);
                     match last {
@@ -1648,7 +1920,11 @@ impl S3 for StorageBackend {
             delimiter: delimiter.map(|d| d.to_string()),
             marker: marker.map(|m| m.to_string()),
             contents: Some(contents),
-            common_prefixes: if common_prefixes.is_empty() { None } else { Some(common_prefixes) },
+            common_prefixes: if common_prefixes.is_empty() {
+                None
+            } else {
+                Some(common_prefixes)
+            },
             is_truncated: Some(is_truncated),
             max_keys: Some(max_keys as i32),
             next_marker,
@@ -1661,25 +1937,40 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
-        self.authorize(&req, "s3:PutObject", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:PutObject",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         let input = req.input;
         let (src_bucket, src_key) = match &input.copy_source {
             CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
             CopySource::AccessPoint { .. } | CopySource::Outpost { .. } => {
-                return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "AccessPoint/Outpost copy source not supported"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::NotImplemented,
+                    "AccessPoint/Outpost copy source not supported",
+                ));
             }
         };
 
-        let (blocks, size, etag) = self.objects.get_object(&src_bucket, &src_key).await
+        let (blocks, size, etag) = self
+            .objects
+            .get_object(&src_bucket, &src_key)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchKey, "Source object not found"))?;
+            .ok_or_else(|| {
+                S3Error::with_message(S3ErrorCode::NoSuchKey, "Source object not found")
+            })?;
 
         let dest_bucket = input.bucket;
         let dest_key = input.key;
         let shard_id = compute_shard_id(&dest_key);
 
         let dest_ref_id = format!("obj:{}:{}", dest_bucket, dest_key);
-        if let Ok(Some((old_blocks, _, _))) = self.objects.get_object(&dest_bucket, &dest_key).await {
+        if let Ok(Some((old_blocks, _, _))) = self.objects.get_object(&dest_bucket, &dest_key).await
+        {
             for hash in old_blocks {
                 let _ = self.blocks.remove_reference(&hash, &dest_ref_id).await;
             }
@@ -1689,7 +1980,9 @@ impl S3 for StorageBackend {
             let _ = self.blocks.add_usage(hash, &dest_ref_id).await;
         }
 
-        self.objects.insert_object(&dest_bucket, shard_id, &dest_key, blocks, size, &etag).await
+        self.objects
+            .insert_object(&dest_bucket, shard_id, &dest_key, blocks, size, &etag)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let output = CopyObjectOutput {
@@ -1707,27 +2000,41 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<ListPartsInput>,
     ) -> S3Result<S3Response<ListPartsOutput>> {
-        self.authorize(&req, "s3:ListMultipartUploadParts", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:ListMultipartUploadParts",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         let input = req.input;
         let upload_id = uuid::Uuid::parse_str(&input.upload_id)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid upload id"))?;
 
-        let _key = self.objects.get_multipart_upload_key(&input.bucket, upload_id).await
+        let _key = self
+            .objects
+            .get_multipart_upload_key(&input.bucket, upload_id)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchUpload, "Upload not found"))?;
 
-        let parts = self.objects.list_parts(&input.bucket, upload_id).await
+        let parts = self
+            .objects
+            .list_parts(&input.bucket, upload_id)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let part_number_marker = input.part_number_marker.unwrap_or(0);
         let max_parts = input.max_parts.unwrap_or(1000).max(1) as usize;
 
-        let filtered: Vec<_> = parts.into_iter()
+        let filtered: Vec<_> = parts
+            .into_iter()
             .filter(|(n, _, _, _)| *n > part_number_marker)
             .collect();
         let is_truncated = filtered.len() > max_parts;
 
-        let result_parts: Vec<Part> = filtered.into_iter()
+        let result_parts: Vec<Part> = filtered
+            .into_iter()
             .take(max_parts)
             .map(|(num, _blocks, size, etag)| Part {
                 part_number: Some(num),
@@ -1762,20 +2069,30 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
-        self.authorize(&req, "s3:ListBucketMultipartUploads", Some(&req.input.bucket), None).await?;
+        self.authorize(
+            &req,
+            "s3:ListBucketMultipartUploads",
+            Some(&req.input.bucket),
+            None,
+        )
+        .await?;
         let input = req.input;
         let max_uploads = input.max_uploads.unwrap_or(1000).max(1) as usize;
 
-        let rows = self.objects.list_multipart_uploads(
-            &input.bucket,
-            input.prefix.as_deref(),
-            input.key_marker.as_deref(),
-            max_uploads,
-        ).await
+        let rows = self
+            .objects
+            .list_multipart_uploads(
+                &input.bucket,
+                input.prefix.as_deref(),
+                input.key_marker.as_deref(),
+                max_uploads,
+            )
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let is_truncated = rows.len() > max_uploads;
-        let uploads: Vec<MultipartUpload> = rows.into_iter()
+        let uploads: Vec<MultipartUpload> = rows
+            .into_iter()
             .take(max_uploads)
             .map(|(key, upload_id)| MultipartUpload {
                 key: Some(key),
@@ -1797,7 +2114,11 @@ impl S3 for StorageBackend {
             key_marker: input.key_marker,
             max_uploads: Some(max_uploads as i32),
             is_truncated: Some(is_truncated),
-            uploads: if uploads.is_empty() { None } else { Some(uploads) },
+            uploads: if uploads.is_empty() {
+                None
+            } else {
+                Some(uploads)
+            },
             next_key_marker,
             delimiter: input.delimiter,
             ..Default::default()
@@ -1809,41 +2130,68 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        self.authorize(&req, "s3:PutObject", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:PutObject",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         self.check_writable()?;
         let input = req.input;
         let upload_id = uuid::Uuid::parse_str(&input.upload_id)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid upload id"))?;
 
-        let _key = self.objects.get_multipart_upload_key(&input.bucket, upload_id).await
+        let _key = self
+            .objects
+            .get_multipart_upload_key(&input.bucket, upload_id)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchUpload, "Upload not found"))?;
 
         let (src_bucket, src_key) = match &input.copy_source {
             CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
             CopySource::AccessPoint { .. } | CopySource::Outpost { .. } => {
-                return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "AccessPoint/Outpost copy source not supported"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::NotImplemented,
+                    "AccessPoint/Outpost copy source not supported",
+                ));
             }
         };
 
-        let (src_blocks, src_size, _src_etag) = self.objects.get_object(&src_bucket, &src_key).await
+        let (src_blocks, src_size, _src_etag) = self
+            .objects
+            .get_object(&src_bucket, &src_key)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchKey, "Source object not found"))?;
+            .ok_or_else(|| {
+                S3Error::with_message(S3ErrorCode::NoSuchKey, "Source object not found")
+            })?;
 
         let (range_start, range_end) = if let Some(ref range_str) = input.copy_source_range {
             let range_str = range_str.strip_prefix("bytes=").unwrap_or(range_str);
             let parts: Vec<&str> = range_str.splitn(2, '-').collect();
             if parts.len() != 2 {
-                return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid copy source range"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "Invalid copy source range",
+                ));
             }
-            let start: u64 = parts[0].parse().map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid range start"))?;
-            let end: u64 = parts[1].parse().map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid range end"))?;
+            let start: u64 = parts[0].parse().map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid range start")
+            })?;
+            let end: u64 = parts[1].parse().map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid range end")
+            })?;
             (start, end)
         } else {
             (0u64, (src_size as u64).saturating_sub(1))
         };
 
-        let sizes = self.objects.block_sizes(&src_blocks).await
+        let sizes = self
+            .objects
+            .block_sizes(&src_blocks)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
         let slices = slice_blocks_for_range(&sizes, range_start, range_end);
 
@@ -1859,8 +2207,10 @@ impl S3 for StorageBackend {
         let mut current_chunk = BytesMut::with_capacity(initial_capacity);
 
         for (i, skip, take) in slices {
-            let data = self.blocks.get_block(&src_blocks[i]).await
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+            let data =
+                self.blocks.get_block(&src_blocks[i]).await.map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                })?;
             let sliced = slice_block_bytes(data, skip, Some(take));
             md5.update(&sliced);
             current_chunk.extend_from_slice(&sliced);
@@ -1868,8 +2218,13 @@ impl S3 for StorageBackend {
             for block_data in self.chunker.process(&mut current_chunk) {
                 let len = block_data.len() as i64;
                 total_size += len;
-                let hash = self.blocks.store_block(block_data, len, &ref_id).await
-                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+                let hash = self
+                    .blocks
+                    .store_block(block_data, len, &ref_id)
+                    .await
+                    .map_err(|e| {
+                        S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                    })?;
                 block_hashes.push(hash);
             }
         }
@@ -1877,13 +2232,25 @@ impl S3 for StorageBackend {
         if let Some(block_data) = self.chunker.finalize(&mut current_chunk) {
             let len = block_data.len() as i64;
             total_size += len;
-            let hash = self.blocks.store_block(block_data, len, &ref_id).await
+            let hash = self
+                .blocks
+                .store_block(block_data, len, &ref_id)
+                .await
                 .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
             block_hashes.push(hash);
         }
 
         let etag = hex::encode(md5.finalize());
-        self.objects.insert_part(&input.bucket, upload_id, input.part_number, block_hashes, total_size, &etag).await
+        self.objects
+            .insert_part(
+                &input.bucket,
+                upload_id,
+                input.part_number,
+                block_hashes,
+                total_size,
+                &etag,
+            )
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let output = UploadPartCopyOutput {
@@ -1901,11 +2268,19 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        self.authorize(&req, "s3:PutObject", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:PutObject",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         let input = req.input;
         let upload_id = uuid::Uuid::new_v4();
 
-        self.objects.create_multipart_upload(&input.bucket, &input.key, upload_id).await
+        self.objects
+            .create_multipart_upload(&input.bucket, &input.key, upload_id)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let output = CreateMultipartUploadOutput {
@@ -1921,14 +2296,23 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
-        self.authorize(&req, "s3:PutObject", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:PutObject",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         self.check_writable()?;
         let input = req.input;
         let upload_id = uuid::Uuid::parse_str(&input.upload_id)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid upload id"))?;
 
         // Verify upload exists and get key
-        let _key = self.objects.get_multipart_upload_key(&input.bucket, upload_id).await
+        let _key = self
+            .objects
+            .get_multipart_upload_key(&input.bucket, upload_id)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchUpload, "Upload not found"))?;
 
@@ -1949,18 +2333,38 @@ impl S3 for StorageBackend {
             algorithm: input.checksum_algorithm,
             content_md5: input.content_md5,
         };
-        let body = input.body.ok_or_else(|| {
-            S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing body")
-        })?;
+        let body = input
+            .body
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing body"))?;
         let ref_id = format!("upload:{}:{}", input.bucket, input.upload_id);
-        let Ingested { block_hashes, total_size, etag, checksum } = self
-            .ingest_body(body, &ref_id, &req.headers, expected, req.trailing_headers.as_ref())
+        let Ingested {
+            block_hashes,
+            total_size,
+            etag,
+            checksum,
+        } = self
+            .ingest_body(
+                body,
+                &ref_id,
+                &req.headers,
+                expected,
+                req.trailing_headers.as_ref(),
+            )
             .await?;
 
-        self.objects.insert_part(&input.bucket, upload_id, input.part_number, block_hashes, total_size, &etag).await
+        self.objects
+            .insert_part(
+                &input.bucket,
+                upload_id,
+                input.part_number,
+                block_hashes,
+                total_size,
+                &etag,
+            )
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let output = UploadPartOutput{
+        let output = UploadPartOutput {
             e_tag: Some(ETag::Strong(etag.to_string())),
             checksum_crc32: checksum.checksum_crc32,
             checksum_crc32c: checksum.checksum_crc32c,
@@ -1981,21 +2385,36 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        self.authorize(&req, "s3:PutObject", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:PutObject",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         let input = req.input;
         let upload_id = uuid::Uuid::parse_str(&input.upload_id)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid upload id"))?;
 
-        let stored_key = self.objects.get_multipart_upload_key(&input.bucket, upload_id).await
+        let stored_key = self
+            .objects
+            .get_multipart_upload_key(&input.bucket, upload_id)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchUpload, "Upload not found"))?;
 
         if stored_key != input.key {
-            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Key in request does not match key for this upload"));
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "Key in request does not match key for this upload",
+            ));
         }
         let key = input.key.clone();
 
-        let mut parts = self.objects.list_parts(&input.bucket, upload_id).await
+        let mut parts = self
+            .objects
+            .list_parts(&input.bucket, upload_id)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         // Sort parts by part number
@@ -2012,12 +2431,17 @@ impl S3 for StorageBackend {
         for (_num, blocks, size, etag) in parts {
             all_block_hashes.extend(blocks);
             total_size += size;
-            let etag_bytes = hex::decode(etag.trim_matches('"'))
-                .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Invalid part etag"))?;
+            let etag_bytes = hex::decode(etag.trim_matches('"')).map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InternalError, "Invalid part etag")
+            })?;
             etag_md5.update(&etag_bytes);
         }
 
-        let final_etag = format!("{}-{}", hex::encode(etag_md5.finalize()), all_block_hashes.len());
+        let final_etag = format!(
+            "{}-{}",
+            hex::encode(etag_md5.finalize()),
+            all_block_hashes.len()
+        );
         let shard_id = crate::hashing::compute_shard_id(&key);
 
         let obj_ref_id = format!("obj:{}:{}", input.bucket, key);
@@ -2036,13 +2460,24 @@ impl S3 for StorageBackend {
             let _ = self.blocks.remove_reference(hash, &up_ref_id).await;
         }
 
-        self.objects.insert_object(&input.bucket, shard_id, &key, all_block_hashes, total_size, &final_etag).await
+        self.objects
+            .insert_object(
+                &input.bucket,
+                shard_id,
+                &key,
+                all_block_hashes,
+                total_size,
+                &final_etag,
+            )
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        self.objects.delete_multipart_upload(&input.bucket, upload_id).await
+        self.objects
+            .delete_multipart_upload(&input.bucket, upload_id)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let output = CompleteMultipartUploadOutput{
+        let output = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket),
             key: Some(key),
             e_tag: Some(ETag::Strong(final_etag.to_string())),
@@ -2055,12 +2490,20 @@ impl S3 for StorageBackend {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        self.authorize(&req, "s3:AbortMultipartUpload", Some(&req.input.bucket), Some(&req.input.key)).await?;
+        self.authorize(
+            &req,
+            "s3:AbortMultipartUpload",
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )
+        .await?;
         let input = req.input;
         let upload_id = uuid::Uuid::parse_str(&input.upload_id)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid upload id"))?;
 
-        self.objects.delete_multipart_upload(&input.bucket, upload_id).await
+        self.objects
+            .delete_multipart_upload(&input.bucket, upload_id)
+            .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
@@ -2072,26 +2515,38 @@ mod tests {
     use super::*;
     use crate::chunking::FixedSizeStrategy;
     use crate::db::ReplicationEntry;
+    use s3s::Body;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use s3s::Body;
 
     // ── plan_replication: the drain loop's pure decision ──────────────────────
 
     fn entry() -> ReplicationEntry {
-        ReplicationEntry { hash: vec![0xAB; 32], next_attempt_at: 0, attempts: 0, enqueued_at: 0 }
+        ReplicationEntry {
+            hash: vec![0xAB; 32],
+            next_attempt_at: 0,
+            attempts: 0,
+            enqueued_at: 0,
+        }
     }
 
     fn locations(ids: &[&str]) -> HashMap<String, Vec<u8>> {
-        ids.iter().map(|id| (id.to_string(), vec![1, 2, 3])).collect()
+        ids.iter()
+            .map(|id| (id.to_string(), vec![1, 2, 3]))
+            .collect()
     }
 
     fn peers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(id, url)| (id.to_string(), url.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(id, url)| (id.to_string(), url.to_string()))
+            .collect()
     }
 
     fn kv(keys: &[&str]) -> Vec<(String, i64, String)> {
-        keys.iter().map(|k| (k.to_string(), 0i64, "etag".to_string())).collect()
+        keys.iter()
+            .map(|k| (k.to_string(), 0i64, "etag".to_string()))
+            .collect()
     }
 
     #[test]
@@ -2104,7 +2559,13 @@ mod tests {
         );
         assert_eq!(common, vec!["datasets/".to_string(), "notes/".to_string()]);
         // Only the key with no delimiter past the prefix stays in Contents.
-        assert_eq!(contents.iter().map(|(k, _, _)| k.clone()).collect::<Vec<_>>(), vec!["top.txt"]);
+        assert_eq!(
+            contents
+                .iter()
+                .map(|(k, _, _)| k.clone())
+                .collect::<Vec<_>>(),
+            vec!["top.txt"]
+        );
     }
 
     #[test]
@@ -2120,8 +2581,20 @@ mod tests {
             "datasets/",
             "/",
         );
-        assert_eq!(common, vec!["datasets/knob_flame_v3/".to_string(), "datasets/other/".to_string()]);
-        assert_eq!(contents.iter().map(|(k, _, _)| k.clone()).collect::<Vec<_>>(), vec!["datasets/top.txt"]);
+        assert_eq!(
+            common,
+            vec![
+                "datasets/knob_flame_v3/".to_string(),
+                "datasets/other/".to_string()
+            ]
+        );
+        assert_eq!(
+            contents
+                .iter()
+                .map(|(k, _, _)| k.clone())
+                .collect::<Vec<_>>(),
+            vec!["datasets/top.txt"]
+        );
     }
 
     #[test]
@@ -2141,7 +2614,13 @@ mod tests {
         );
         // 4 items, max 3 → truncated at the 3rd in key order (a.txt, m/, n/).
         assert!(truncated);
-        assert_eq!(contents.iter().map(|(k, _, _)| k.clone()).collect::<Vec<_>>(), vec!["a.txt"]);
+        assert_eq!(
+            contents
+                .iter()
+                .map(|(k, _, _)| k.clone())
+                .collect::<Vec<_>>(),
+            vec!["a.txt"]
+        );
         assert_eq!(common, vec!["m/".to_string(), "n/".to_string()]);
         assert_eq!(next.as_deref(), Some("n/"));
     }
@@ -2156,18 +2635,69 @@ mod tests {
     #[test]
     fn resolve_range_int_and_suffix() {
         // Explicit start-end (inclusive).
-        assert_eq!(resolve_range(&Range::Int { first: 0, last: Some(9) }, 100), Some((0, 9)));
+        assert_eq!(
+            resolve_range(
+                &Range::Int {
+                    first: 0,
+                    last: Some(9)
+                },
+                100
+            ),
+            Some((0, 9))
+        );
         // Open-ended start → to EOF.
-        assert_eq!(resolve_range(&Range::Int { first: 50, last: None }, 100), Some((50, 99)));
+        assert_eq!(
+            resolve_range(
+                &Range::Int {
+                    first: 50,
+                    last: None
+                },
+                100
+            ),
+            Some((50, 99))
+        );
         // last past EOF clamps.
-        assert_eq!(resolve_range(&Range::Int { first: 90, last: Some(999) }, 100), Some((90, 99)));
+        assert_eq!(
+            resolve_range(
+                &Range::Int {
+                    first: 90,
+                    last: Some(999)
+                },
+                100
+            ),
+            Some((90, 99))
+        );
         // Suffix: last N bytes.
-        assert_eq!(resolve_range(&Range::Suffix { length: 20 }, 100), Some((80, 99)));
+        assert_eq!(
+            resolve_range(&Range::Suffix { length: 20 }, 100),
+            Some((80, 99))
+        );
         // Suffix longer than object → whole object.
-        assert_eq!(resolve_range(&Range::Suffix { length: 500 }, 100), Some((0, 99)));
+        assert_eq!(
+            resolve_range(&Range::Suffix { length: 500 }, 100),
+            Some((0, 99))
+        );
         // Unsatisfiable: start beyond EOF, or empty object.
-        assert_eq!(resolve_range(&Range::Int { first: 100, last: None }, 100), None);
-        assert_eq!(resolve_range(&Range::Int { first: 0, last: None }, 0), None);
+        assert_eq!(
+            resolve_range(
+                &Range::Int {
+                    first: 100,
+                    last: None
+                },
+                100
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_range(
+                &Range::Int {
+                    first: 0,
+                    last: None
+                },
+                0
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2177,11 +2707,17 @@ mod tests {
         // A range fully inside the middle block.
         assert_eq!(slice_blocks_for_range(&sizes, 12, 15), vec![(1, 2, 4)]);
         // A range spanning all three blocks with partial first/last.
-        assert_eq!(slice_blocks_for_range(&sizes, 5, 24), vec![(0, 5, 5), (1, 0, 10), (2, 0, 5)]);
+        assert_eq!(
+            slice_blocks_for_range(&sizes, 5, 24),
+            vec![(0, 5, 5), (1, 0, 10), (2, 0, 5)]
+        );
         // Exactly on a block boundary.
         assert_eq!(slice_blocks_for_range(&sizes, 10, 19), vec![(1, 0, 10)]);
         // Whole object.
-        assert_eq!(slice_blocks_for_range(&sizes, 0, 29), vec![(0, 0, 10), (1, 0, 10), (2, 0, 10)]);
+        assert_eq!(
+            slice_blocks_for_range(&sizes, 0, 29),
+            vec![(0, 0, 10), (1, 0, 10), (2, 0, 10)]
+        );
         // Last byte only.
         assert_eq!(slice_blocks_for_range(&sizes, 29, 29), vec![(2, 9, 1)]);
     }
@@ -2189,23 +2725,42 @@ mod tests {
     #[test]
     fn slice_block_bytes_skips_and_takes() {
         let b = Bytes::from_static(b"0123456789");
-        assert_eq!(slice_block_bytes(b.clone(), 0, None), Bytes::from_static(b"0123456789"));
-        assert_eq!(slice_block_bytes(b.clone(), 2, Some(3)), Bytes::from_static(b"234"));
-        assert_eq!(slice_block_bytes(b.clone(), 8, Some(50)), Bytes::from_static(b"89"));
+        assert_eq!(
+            slice_block_bytes(b.clone(), 0, None),
+            Bytes::from_static(b"0123456789")
+        );
+        assert_eq!(
+            slice_block_bytes(b.clone(), 2, Some(3)),
+            Bytes::from_static(b"234")
+        );
+        assert_eq!(
+            slice_block_bytes(b.clone(), 8, Some(50)),
+            Bytes::from_static(b"89")
+        );
         assert_eq!(slice_block_bytes(b, 20, None), Bytes::from_static(b""));
     }
 
     #[test]
     fn plan_drops_when_block_has_no_locations() {
         // Block was deleted globally before replication ran.
-        let plan = plan_replication(&entry(), &locations(&[]), "site-a", &peers(&[("site-b", "u")]));
+        let plan = plan_replication(
+            &entry(),
+            &locations(&[]),
+            "site-a",
+            &peers(&[("site-b", "u")]),
+        );
         assert_eq!(plan, ReplicationPlan::Drop);
     }
 
     #[test]
     fn plan_drops_when_we_already_hold_it_locally() {
         // local_id is among the block's locations — nothing to replicate.
-        let plan = plan_replication(&entry(), &locations(&["site-a", "site-b"]), "site-a", &peers(&[("site-b", "u")]));
+        let plan = plan_replication(
+            &entry(),
+            &locations(&["site-a", "site-b"]),
+            "site-a",
+            &peers(&[("site-b", "u")]),
+        );
         assert_eq!(plan, ReplicationPlan::Drop);
     }
 
@@ -2213,7 +2768,12 @@ mod tests {
     fn plan_defers_when_no_live_peer_holds_it() {
         // The block lives only on site-c, which is NOT in the live peer set
         // (it's down / evicted by heartbeat). Must back off, not drop.
-        let plan = plan_replication(&entry(), &locations(&["site-c"]), "site-a", &peers(&[("site-b", "u")]));
+        let plan = plan_replication(
+            &entry(),
+            &locations(&["site-c"]),
+            "site-a",
+            &peers(&[("site-b", "u")]),
+        );
         assert_eq!(plan, ReplicationPlan::Defer);
     }
 
@@ -2299,11 +2859,24 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for MockObjectStore {
-        async fn insert_object(&self, bucket: &str, _shard_id: i32, key: &str, _blocks: Vec<Vec<u8>>, size: i64, etag: &str) -> Result<(), anyhow::Error> {
-            *self.inserted.lock().unwrap() = Some((bucket.to_string(), key.to_string(), size, etag.to_string()));
+        async fn insert_object(
+            &self,
+            bucket: &str,
+            _shard_id: i32,
+            key: &str,
+            _blocks: Vec<Vec<u8>>,
+            size: i64,
+            etag: &str,
+        ) -> Result<(), anyhow::Error> {
+            *self.inserted.lock().unwrap() =
+                Some((bucket.to_string(), key.to_string(), size, etag.to_string()));
             Ok(())
         }
-        async fn get_object(&self, _b: &str, _k: &str) -> Result<Option<(Vec<Vec<u8>>, i64, String)>, anyhow::Error> {
+        async fn get_object(
+            &self,
+            _b: &str,
+            _k: &str,
+        ) -> Result<Option<(Vec<Vec<u8>>, i64, String)>, anyhow::Error> {
             Ok(self.existing.lock().unwrap().clone())
         }
         async fn block_sizes(&self, hashes: &[Vec<u8>]) -> Result<Vec<i64>, anyhow::Error> {
@@ -2312,30 +2885,82 @@ mod tests {
         async fn list_buckets(&self) -> Result<Vec<(String, i64)>, anyhow::Error> {
             Ok(vec![])
         }
-        async fn list_objects(&self, _b: &str, _s: Option<&str>, _p: Option<&str>, _ps: usize) -> Result<(Vec<(String, i64, String)>, bool), anyhow::Error> {
+        async fn list_objects(
+            &self,
+            _b: &str,
+            _s: Option<&str>,
+            _p: Option<&str>,
+            _ps: usize,
+        ) -> Result<(Vec<(String, i64, String)>, bool), anyhow::Error> {
             // Surface the "existing" object (if any) under key "k".
             let existing = self.existing.lock().unwrap().clone();
-            Ok((existing.into_iter().map(|(_, size, etag)| ("k".to_string(), size, etag)).collect(), false))
+            Ok((
+                existing
+                    .into_iter()
+                    .map(|(_, size, etag)| ("k".to_string(), size, etag))
+                    .collect(),
+                false,
+            ))
         }
         async fn delete_object(&self, b: &str, k: &str) -> Result<(), anyhow::Error> {
-            self.delete_calls.lock().unwrap().push((b.to_string(), k.to_string()));
+            self.delete_calls
+                .lock()
+                .unwrap()
+                .push((b.to_string(), k.to_string()));
             Ok(())
         }
-        async fn create_multipart_upload(&self, _b: &str, _k: &str, _u: uuid::Uuid) -> Result<(), anyhow::Error> { Ok(()) }
-        async fn get_multipart_upload_key(&self, _b: &str, _u: uuid::Uuid) -> Result<Option<String>, anyhow::Error> {
+        async fn create_multipart_upload(
+            &self,
+            _b: &str,
+            _k: &str,
+            _u: uuid::Uuid,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        async fn get_multipart_upload_key(
+            &self,
+            _b: &str,
+            _u: uuid::Uuid,
+        ) -> Result<Option<String>, anyhow::Error> {
             // Return "k" to match the key used in complete_input().
             Ok(Some("k".to_string()))
         }
-        async fn insert_part(&self, _b: &str, _u: uuid::Uuid, _n: i32, _bl: Vec<Vec<u8>>, _s: i64, _e: &str) -> Result<(), anyhow::Error> { Ok(()) }
-        async fn list_parts(&self, _b: &str, _u: uuid::Uuid) -> Result<Vec<(i32, Vec<Vec<u8>>, i64, String)>, anyhow::Error> {
+        async fn insert_part(
+            &self,
+            _b: &str,
+            _u: uuid::Uuid,
+            _n: i32,
+            _bl: Vec<Vec<u8>>,
+            _s: i64,
+            _e: &str,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        async fn list_parts(
+            &self,
+            _b: &str,
+            _u: uuid::Uuid,
+        ) -> Result<Vec<(i32, Vec<Vec<u8>>, i64, String)>, anyhow::Error> {
             // Return two small parts for multipart tests.
             Ok(vec![
                 (1, vec![vec![0u8; 32]], 10, "aabbccdd".to_string()),
                 (2, vec![vec![1u8; 32]], 10, "eeff0011".to_string()),
             ])
         }
-        async fn delete_multipart_upload(&self, _b: &str, _u: uuid::Uuid) -> Result<(), anyhow::Error> { Ok(()) }
-        async fn list_multipart_uploads(&self, _b: &str, _p: Option<&str>, _k: Option<&str>, _m: usize) -> Result<Vec<(String, String)>, anyhow::Error> {
+        async fn delete_multipart_upload(
+            &self,
+            _b: &str,
+            _u: uuid::Uuid,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        async fn list_multipart_uploads(
+            &self,
+            _b: &str,
+            _p: Option<&str>,
+            _k: Option<&str>,
+            _m: usize,
+        ) -> Result<Vec<(String, String)>, anyhow::Error> {
             Ok(vec![])
         }
     }
@@ -2369,7 +2994,12 @@ mod tests {
 
     #[async_trait]
     impl BlockStore for MockBlockStore {
-        async fn store_block(&self, _data: Bytes, _size: i64, _ref_id: &str) -> Result<Vec<u8>, anyhow::Error> {
+        async fn store_block(
+            &self,
+            _data: Bytes,
+            _size: i64,
+            _ref_id: &str,
+        ) -> Result<Vec<u8>, anyhow::Error> {
             *self.stored_count.lock().unwrap() += 1;
             Ok(vec![0u8; 32])
         }
@@ -2387,7 +3017,11 @@ mod tests {
         async fn promote_local(&self, _hash: &[u8], _data: Bytes) -> Result<(), anyhow::Error> {
             Ok(())
         }
-        async fn fetch_from_peer(&self, _peer_url: &str, _hash: &[u8]) -> Result<Bytes, anyhow::Error> {
+        async fn fetch_from_peer(
+            &self,
+            _peer_url: &str,
+            _hash: &[u8],
+        ) -> Result<Bytes, anyhow::Error> {
             Ok(Bytes::new())
         }
         async fn delete_block(&self, _hash: &[u8], _fid: &[u8]) -> Result<(), anyhow::Error> {
@@ -2412,10 +3046,14 @@ mod tests {
             },
             storage: crate::config::StorageConfig {
                 local_location_id: "test-site".to_string(),
-                backend: crate::config::BlockBackend::Local { path: "/tmp/ss-test-blocks".to_string() },
+                backend: crate::config::BlockBackend::Local {
+                    path: "/tmp/ss-test-blocks".to_string(),
+                },
                 min_free_bytes: None,
                 max_bytes: None,
-                chunking: crate::config::ChunkingConfig::Fixed { max_block_size: 1024 * 1024 },
+                chunking: crate::config::ChunkingConfig::Fixed {
+                    max_block_size: 1024 * 1024,
+                },
                 gc_grace_period_seconds: 300,
                 gc_interval_seconds: 60,
             },
@@ -2492,7 +3130,10 @@ mod tests {
     async fn gc_never_reaps_a_referenced_block() {
         let (backend, store) = gc_backend(0).await;
         store.store_local_block(&gh(1), b"3,01", 10).await.unwrap();
-        store.insert_object("b", 0, "k", vec![gh(1)], 10, "e").await.unwrap();
+        store
+            .insert_object("b", 0, "k", vec![gh(1)], 10, "e")
+            .await
+            .unwrap();
 
         backend.reap_orphaned_blocks().await.unwrap(); // grace 0, but referenced
         assert!(
@@ -2535,7 +3176,10 @@ mod tests {
         assert_eq!(store.get_pending_deletions().await.unwrap().len(), 1);
 
         // A new object references it → next sweep cancels the pending reap.
-        store.insert_object("b", 0, "k4", vec![gh(4)], 10, "e").await.unwrap();
+        store
+            .insert_object("b", 0, "k4", vec![gh(4)], 10, "e")
+            .await
+            .unwrap();
         backend.reap_orphaned_blocks().await.unwrap();
         assert!(store.get_pending_deletions().await.unwrap().is_empty());
         assert!(store.get_local_block_fid(&gh(4)).await.unwrap().is_some());
@@ -2614,7 +3258,10 @@ mod tests {
         let objects = MockObjectStore::new();
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
-        backend.put_object(s3req(put_input("b", "k", vec![1, 2, 3]))).await.unwrap();
+        backend
+            .put_object(s3req(put_input("b", "k", vec![1, 2, 3])))
+            .await
+            .unwrap();
         assert!(objects.inserted.lock().unwrap().is_some());
     }
 
@@ -2627,7 +3274,10 @@ mod tests {
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
 
         let data = vec![0x41u8; 25]; // 'A' * 25
-        let res = backend.put_object(s3req(put_input("b", "k", data))).await.unwrap();
+        let res = backend
+            .put_object(s3req(put_input("b", "k", data)))
+            .await
+            .unwrap();
 
         assert_eq!(*blocks.stored_count.lock().unwrap(), 3); // 10 + 10 + 5
         let inserted = objects.inserted.lock().unwrap();
@@ -2636,7 +3286,10 @@ mod tests {
         assert_eq!(key, "k");
         assert_eq!(*size, 25);
         assert_eq!(etag, "1995da96cd16a48cebcbc08424f6f945");
-        assert_eq!(res.output.e_tag.unwrap().into_value(), "1995da96cd16a48cebcbc08424f6f945");
+        assert_eq!(
+            res.output.e_tag.unwrap().into_value(),
+            "1995da96cd16a48cebcbc08424f6f945"
+        );
     }
 
     #[tokio::test]
@@ -2645,7 +3298,10 @@ mod tests {
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
 
-        let res = backend.put_object(s3req(put_input("b", "empty", vec![]))).await.unwrap();
+        let res = backend
+            .put_object(s3req(put_input("b", "empty", vec![])))
+            .await
+            .unwrap();
 
         // No blocks to store.
         assert_eq!(*blocks.stored_count.lock().unwrap(), 0);
@@ -2653,7 +3309,10 @@ mod tests {
         let (_, _, size, _) = inserted.as_ref().unwrap();
         assert_eq!(*size, 0);
         // MD5 of empty string
-        assert_eq!(res.output.e_tag.unwrap().into_value(), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(
+            res.output.e_tag.unwrap().into_value(),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
     }
 
     #[tokio::test]
@@ -2662,14 +3321,20 @@ mod tests {
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
 
-        let res = backend.put_object(s3req(put_input("b", "one", vec![0x61]))).await.unwrap();
+        let res = backend
+            .put_object(s3req(put_input("b", "one", vec![0x61])))
+            .await
+            .unwrap();
 
         assert_eq!(*blocks.stored_count.lock().unwrap(), 1);
         let inserted = objects.inserted.lock().unwrap();
         let (_, _, size, _) = inserted.as_ref().unwrap();
         assert_eq!(*size, 1);
         // MD5 of a single byte 0x61 ('a') = 0cc175b9c0f1b6a831c399e269772661
-        assert_eq!(res.output.e_tag.unwrap().into_value(), "0cc175b9c0f1b6a831c399e269772661");
+        assert_eq!(
+            res.output.e_tag.unwrap().into_value(),
+            "0cc175b9c0f1b6a831c399e269772661"
+        );
     }
 
     #[tokio::test]
@@ -2679,7 +3344,10 @@ mod tests {
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
 
-        backend.put_object(s3req(put_input("b", "k", vec![0xBBu8; 20]))).await.unwrap();
+        backend
+            .put_object(s3req(put_input("b", "k", vec![0xBBu8; 20])))
+            .await
+            .unwrap();
         assert_eq!(*blocks.stored_count.lock().unwrap(), 2);
     }
 
@@ -2691,7 +3359,10 @@ mod tests {
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
 
-        backend.put_object(s3req(put_input("b", "k", vec![0x42u8; 5]))).await.unwrap();
+        backend
+            .put_object(s3req(put_input("b", "k", vec![0x42u8; 5])))
+            .await
+            .unwrap();
 
         // remove_reference must have been called with the old ref_id.
         let removed = blocks.removed_refs.lock().unwrap();
@@ -2704,11 +3375,17 @@ mod tests {
     #[tokio::test]
     async fn put_object_etag_is_quoted_in_response() {
         let backend = make_backend(MockObjectStore::new(), MockBlockStore::new(), 64);
-        let res = backend.put_object(s3req(put_input("b", "k", vec![1, 2, 3]))).await.unwrap();
+        let res = backend
+            .put_object(s3req(put_input("b", "k", vec![1, 2, 3])))
+            .await
+            .unwrap();
         // A strong ETag, which s3s serializes quoted on the wire (the HTTP-level
         // test `service_put_get_round_trip_etag_quoted` checks the header).
         let etag = res.output.e_tag.unwrap();
-        assert!(matches!(etag, ETag::Strong(ref v) if !v.contains('"')), "{etag:?}");
+        assert!(
+            matches!(etag, ETag::Strong(ref v) if !v.contains('"')),
+            "{etag:?}"
+        );
     }
 
     // ── get_object ────────────────────────────────────────────────────────────
@@ -2717,14 +3394,25 @@ mod tests {
         GetObjectInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            checksum_mode: None, expected_bucket_owner: None, if_match: None,
-            if_modified_since: None, if_none_match: None, if_unmodified_since: None,
-            part_number: None, range: None, request_payer: None,
-            response_cache_control: None, response_content_disposition: None,
-            response_content_encoding: None, response_content_language: None,
-            response_content_type: None, response_expires: None,
-            sse_customer_algorithm: None, sse_customer_key: None,
-            sse_customer_key_md5: None, version_id: None,
+            checksum_mode: None,
+            expected_bucket_owner: None,
+            if_match: None,
+            if_modified_since: None,
+            if_none_match: None,
+            if_unmodified_since: None,
+            part_number: None,
+            range: None,
+            request_payer: None,
+            response_cache_control: None,
+            response_content_disposition: None,
+            response_content_encoding: None,
+            response_content_language: None,
+            response_content_type: None,
+            response_expires: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            version_id: None,
         }
     }
 
@@ -2734,7 +3422,10 @@ mod tests {
         let blocks = MockBlockStore::with_data(Bytes::from(vec![0xCCu8; 42]));
         let backend = make_backend(objects, blocks, 64);
 
-        let res = backend.get_object(s3req(get_input("b", "k"))).await.unwrap();
+        let res = backend
+            .get_object(s3req(get_input("b", "k")))
+            .await
+            .unwrap();
         assert_eq!(res.output.content_length, Some(42));
         assert_eq!(res.output.e_tag, Some(ETag::Strong("myetag".to_string())));
     }
@@ -2754,9 +3445,14 @@ mod tests {
         DeleteObjectInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            bypass_governance_retention: None, expected_bucket_owner: None,
-            if_match: None, if_match_last_modified_time: None, if_match_size: None,
-            mfa: None, request_payer: None, version_id: None,
+            bypass_governance_retention: None,
+            expected_bucket_owner: None,
+            if_match: None,
+            if_match_last_modified_time: None,
+            if_match_size: None,
+            mfa: None,
+            request_payer: None,
+            version_id: None,
         }
     }
 
@@ -2767,10 +3463,16 @@ mod tests {
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 64);
 
-        backend.delete_object(s3req(delete_input("b", "k"))).await.unwrap();
+        backend
+            .delete_object(s3req(delete_input("b", "k")))
+            .await
+            .unwrap();
 
         let removed = blocks.removed_refs.lock().unwrap();
-        assert!(removed.iter().any(|r| r == "obj:b:k"), "remove_reference not called: {removed:?}");
+        assert!(
+            removed.iter().any(|r| r == "obj:b:k"),
+            "remove_reference not called: {removed:?}"
+        );
 
         let deleted = objects.delete_calls.lock().unwrap();
         assert_eq!(deleted.as_slice(), &[("b".to_string(), "k".to_string())]);
@@ -2781,10 +3483,16 @@ mod tests {
         let objects = MockObjectStore::new();
         let backend = make_backend(objects.clone(), MockBlockStore::new(), 64);
 
-        backend.delete_object(s3req(delete_input("b", "ghost"))).await.unwrap();
+        backend
+            .delete_object(s3req(delete_input("b", "ghost")))
+            .await
+            .unwrap();
 
         let deleted = objects.delete_calls.lock().unwrap();
-        assert_eq!(deleted.as_slice(), &[("b".to_string(), "ghost".to_string())]);
+        assert_eq!(
+            deleted.as_slice(),
+            &[("b".to_string(), "ghost".to_string())]
+        );
     }
 
     // ── delete_objects (batch) ────────────────────────────────────────────────
@@ -2798,13 +3506,28 @@ mod tests {
             bucket: "b".to_string(),
             delete: Delete {
                 objects: vec![
-                    ObjectIdentifier { key: "k1".to_string(), e_tag: None, last_modified_time: None, size: None, version_id: None },
-                    ObjectIdentifier { key: "k2".to_string(), e_tag: None, last_modified_time: None, size: None, version_id: None },
+                    ObjectIdentifier {
+                        key: "k1".to_string(),
+                        e_tag: None,
+                        last_modified_time: None,
+                        size: None,
+                        version_id: None,
+                    },
+                    ObjectIdentifier {
+                        key: "k2".to_string(),
+                        e_tag: None,
+                        last_modified_time: None,
+                        size: None,
+                        version_id: None,
+                    },
                 ],
                 quiet: None,
             },
-            bypass_governance_retention: None, checksum_algorithm: None,
-            expected_bucket_owner: None, mfa: None, request_payer: None,
+            bypass_governance_retention: None,
+            checksum_algorithm: None,
+            expected_bucket_owner: None,
+            mfa: None,
+            request_payer: None,
         };
         let res = backend.delete_objects(s3req(input)).await.unwrap();
         let deleted = res.output.deleted.unwrap_or_default();
@@ -2819,14 +3542,25 @@ mod tests {
         HeadObjectInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            checksum_mode: None, expected_bucket_owner: None, if_match: None,
-            if_modified_since: None, if_none_match: None, if_unmodified_since: None,
-            part_number: None, range: None, request_payer: None,
-            response_cache_control: None, response_content_disposition: None,
-            response_content_encoding: None, response_content_language: None,
-            response_content_type: None, response_expires: None,
-            sse_customer_algorithm: None, sse_customer_key: None,
-            sse_customer_key_md5: None, version_id: None,
+            checksum_mode: None,
+            expected_bucket_owner: None,
+            if_match: None,
+            if_modified_since: None,
+            if_none_match: None,
+            if_unmodified_since: None,
+            part_number: None,
+            range: None,
+            request_payer: None,
+            response_cache_control: None,
+            response_content_disposition: None,
+            response_content_encoding: None,
+            response_content_language: None,
+            response_content_type: None,
+            response_expires: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            version_id: None,
         }
     }
 
@@ -2835,7 +3569,10 @@ mod tests {
         let objects = MockObjectStore::with_existing(vec![vec![0u8; 32]], 99, "headetag");
         let backend = make_backend(objects, MockBlockStore::new(), 64);
 
-        let res = backend.head_object(s3req(head_input("b", "k"))).await.unwrap();
+        let res = backend
+            .head_object(s3req(head_input("b", "k")))
+            .await
+            .unwrap();
         assert_eq!(res.output.content_length, Some(99));
         assert_eq!(res.output.e_tag, Some(ETag::Strong("headetag".to_string())));
     }
@@ -2856,10 +3593,16 @@ mod tests {
         let backend = make_backend(MockObjectStore::new(), MockBlockStore::new(), 64);
         let input = ListObjectsV2Input {
             bucket: "b".to_string(),
-            continuation_token: None, delimiter: None, encoding_type: None,
-            expected_bucket_owner: None, fetch_owner: None, max_keys: None,
+            continuation_token: None,
+            delimiter: None,
+            encoding_type: None,
+            expected_bucket_owner: None,
+            fetch_owner: None,
+            max_keys: None,
             optional_object_attributes: None,
-            prefix: None, request_payer: None, start_after: None,
+            prefix: None,
+            request_payer: None,
+            start_after: None,
         };
         let res = backend.list_objects_v2(s3req(input)).await.unwrap();
         assert_eq!(res.output.key_count, Some(0));
@@ -2871,16 +3614,25 @@ mod tests {
     fn versions_input(bucket: &str) -> ListObjectVersionsInput {
         ListObjectVersionsInput {
             bucket: bucket.to_string(),
-            delimiter: None, encoding_type: None, expected_bucket_owner: None,
-            key_marker: None, max_keys: None, optional_object_attributes: None,
-            prefix: None, request_payer: None, version_id_marker: None,
+            delimiter: None,
+            encoding_type: None,
+            expected_bucket_owner: None,
+            key_marker: None,
+            max_keys: None,
+            optional_object_attributes: None,
+            prefix: None,
+            request_payer: None,
+            version_id_marker: None,
         }
     }
 
     #[tokio::test]
     async fn list_object_versions_empty_bucket() {
         let backend = make_backend(MockObjectStore::new(), MockBlockStore::new(), 64);
-        let res = backend.list_object_versions(s3req(versions_input("b"))).await.unwrap();
+        let res = backend
+            .list_object_versions(s3req(versions_input("b")))
+            .await
+            .unwrap();
         assert_eq!(res.output.versions.as_deref().map(|v| v.len()), Some(0));
         assert_eq!(res.output.is_truncated, Some(false));
         assert_eq!(res.output.name.as_deref(), Some("b"));
@@ -2890,7 +3642,10 @@ mod tests {
     async fn list_object_versions_reports_single_null_version_per_object() {
         let objects = MockObjectStore::with_existing(vec![vec![0u8; 32]], 42, "vetag");
         let backend = make_backend(objects, MockBlockStore::new(), 64);
-        let res = backend.list_object_versions(s3req(versions_input("b"))).await.unwrap();
+        let res = backend
+            .list_object_versions(s3req(versions_input("b")))
+            .await
+            .unwrap();
         let versions = res.output.versions.unwrap();
         assert_eq!(versions.len(), 1);
         let v = &versions[0];
@@ -2912,17 +3667,37 @@ mod tests {
             upload_id: upload_id.to_string(),
             multipart_upload: Some(CompletedMultipartUpload {
                 parts: Some(vec![
-                    CompletedPart { part_number: Some(1), e_tag: Some(ETag::Strong("aabbccdd".to_string())), ..Default::default() },
-                    CompletedPart { part_number: Some(2), e_tag: Some(ETag::Strong("eeff0011".to_string())), ..Default::default() },
+                    CompletedPart {
+                        part_number: Some(1),
+                        e_tag: Some(ETag::Strong("aabbccdd".to_string())),
+                        ..Default::default()
+                    },
+                    CompletedPart {
+                        part_number: Some(2),
+                        e_tag: Some(ETag::Strong("eeff0011".to_string())),
+                        ..Default::default()
+                    },
                 ]),
             }),
-            checksum_crc32: None, checksum_crc32c: None, checksum_crc64nvme: None,
-            checksum_md5: None, checksum_sha1: None, checksum_sha256: None,
-            checksum_sha512: None, checksum_type: None, checksum_xxhash128: None,
-            checksum_xxhash3: None, checksum_xxhash64: None,
-            expected_bucket_owner: None, if_match: None, if_none_match: None,
-            mpu_object_size: None, request_payer: None, sse_customer_algorithm: None,
-            sse_customer_key: None, sse_customer_key_md5: None,
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_crc64nvme: None,
+            checksum_md5: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            checksum_sha512: None,
+            checksum_type: None,
+            checksum_xxhash128: None,
+            checksum_xxhash3: None,
+            checksum_xxhash64: None,
+            expected_bucket_owner: None,
+            if_match: None,
+            if_none_match: None,
+            mpu_object_size: None,
+            request_payer: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
         }
     }
 
@@ -2933,12 +3708,19 @@ mod tests {
         let backend = make_backend(objects.clone(), blocks.clone(), 64);
 
         let upload_id = uuid::Uuid::new_v4();
-        let res = backend.complete_multipart_upload(s3req(
-            complete_input("b", "k", &upload_id.to_string())
-        )).await.unwrap();
+        let res = backend
+            .complete_multipart_upload(s3req(complete_input("b", "k", &upload_id.to_string())))
+            .await
+            .unwrap();
 
-        assert!(res.output.e_tag.is_some(), "expected an ETag in the response");
-        assert!(objects.inserted.lock().unwrap().is_some(), "insert_object was never called");
+        assert!(
+            res.output.e_tag.is_some(),
+            "expected an ETag in the response"
+        );
+        assert!(
+            objects.inserted.lock().unwrap().is_some(),
+            "insert_object was never called"
+        );
     }
 
     #[tokio::test]
@@ -2948,16 +3730,22 @@ mod tests {
         let backend = make_backend(objects.clone(), blocks.clone(), 64);
 
         let upload_id = uuid::Uuid::new_v4();
-        backend.complete_multipart_upload(s3req(
-            complete_input("b", "k", &upload_id.to_string())
-        )).await.unwrap();
+        backend
+            .complete_multipart_upload(s3req(complete_input("b", "k", &upload_id.to_string())))
+            .await
+            .unwrap();
 
         let added = blocks.added_usages.lock().unwrap();
         let removed = blocks.removed_refs.lock().unwrap();
 
-        assert!(added.iter().any(|r| r == "obj:b:k"), "obj ref not added: {added:?}");
         assert!(
-            removed.iter().any(|r| r == &format!("upload:b:{upload_id}")),
+            added.iter().any(|r| r == "obj:b:k"),
+            "obj ref not added: {added:?}"
+        );
+        assert!(
+            removed
+                .iter()
+                .any(|r| r == &format!("upload:b:{upload_id}")),
             "upload ref not removed: {removed:?}"
         );
     }
@@ -2986,7 +3774,9 @@ mod tests {
             bucket: "b".to_string(),
             key: "k".to_string(),
             upload_id: upload_id.to_string(),
-            expected_bucket_owner: None, if_match_initiated_time: None, request_payer: None,
+            expected_bucket_owner: None,
+            if_match_initiated_time: None,
+            request_payer: None,
         };
         backend.abort_multipart_upload(s3req(input)).await.unwrap();
     }
@@ -3001,7 +3791,10 @@ mod tests {
 
         async fn etag_for_chunk_size(data: Vec<u8>, chunk: usize) -> String {
             let b = make_backend(MockObjectStore::new(), MockBlockStore::new(), chunk);
-            let res = b.put_object(s3req(put_input("b", "k", data))).await.unwrap();
+            let res = b
+                .put_object(s3req(put_input("b", "k", data)))
+                .await
+                .unwrap();
             res.output.e_tag.unwrap().into_value()
         }
 

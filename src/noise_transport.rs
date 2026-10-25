@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use anyhow::{Result, anyhow};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use bytes::{Buf, BufMut, BytesMut};
 use snow::Builder;
 use std::pin::Pin;
@@ -282,10 +282,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for NoiseStream<S> {
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         match this.flush_write_cipher(cx) {
             Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_flush(cx),
@@ -293,10 +290,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for NoiseStream<S> {
         }
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         match this.flush_write_cipher(cx) {
             Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_shutdown(cx),
@@ -331,9 +325,9 @@ impl<S: AsyncWrite + Unpin> NoiseStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 
     fn test_keys() -> (Vec<u8>, Vec<u8>, [u8; 32]) {
         let initiator = decode_private_key(&generate_private_key().unwrap()).unwrap();
@@ -349,9 +343,8 @@ mod tests {
         let (i_io, r_io) = duplex(64 * 1024);
         let (i_key, r_key, psk) = test_keys();
 
-        let responder = tokio::spawn(async move {
-            NoiseStream::accept(r_io, &r_key, &psk).await.unwrap()
-        });
+        let responder =
+            tokio::spawn(async move { NoiseStream::accept(r_io, &r_key, &psk).await.unwrap() });
         let initiator = NoiseStream::connect(i_io, &i_key, &psk).await.unwrap();
         let responder = responder.await.unwrap();
         (initiator, responder)
@@ -376,9 +369,8 @@ mod tests {
         let psk_a = derive_psk("secret-a");
         let psk_b = derive_psk("secret-b");
 
-        let responder = tokio::spawn(async move {
-            NoiseStream::accept(r_io, &r_key, &psk_b).await
-        });
+        let responder =
+            tokio::spawn(async move { NoiseStream::accept(r_io, &r_key, &psk_b).await });
         let client = NoiseStream::connect(i_io, &i_key, &psk_a).await;
         let server = responder.await.unwrap();
 
@@ -398,7 +390,9 @@ mod tests {
 
         // ~600 KB: forces ~10 noise frames. Use a non-trivial pattern so a
         // dropped/duplicated/reordered frame can't accidentally pass.
-        let payload: Vec<u8> = (0..600_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let payload: Vec<u8> = (0..600_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
         let expected = payload.clone();
 
         let reader = tokio::spawn(async move {
@@ -442,7 +436,11 @@ mod tests {
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
             // Force a Pending on every other call to stress the resumption path.
-            if self.pending_toggle.fetch_add(1, Ordering::Relaxed).is_multiple_of(2) {
+            if self
+                .pending_toggle
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(2)
+            {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -450,10 +448,7 @@ mod tests {
             Pin::new(&mut self.inner).poll_write(cx, &buf[..n])
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Pin::new(&mut self.inner).poll_flush(cx)
         }
 
@@ -481,9 +476,8 @@ mod tests {
         };
 
         let psk_r = psk;
-        let responder = tokio::spawn(async move {
-            NoiseStream::accept(r_io, &r_key, &psk_r).await.unwrap()
-        });
+        let responder =
+            tokio::spawn(async move { NoiseStream::accept(r_io, &r_key, &psk_r).await.unwrap() });
         let mut client = NoiseStream::connect(throttled, &i_key, &psk).await.unwrap();
         let mut server = responder.await.unwrap();
 
@@ -509,8 +503,12 @@ mod tests {
     async fn concurrent_bidirectional_traffic_does_not_corrupt() {
         let (a, b) = connected_pair().await;
 
-        let a_to_b: Vec<u8> = (0..150_000u32).map(|i| (i.wrapping_mul(31)) as u8).collect();
-        let b_to_a: Vec<u8> = (0..150_000u32).map(|i| (i.wrapping_mul(17).wrapping_add(5)) as u8).collect();
+        let a_to_b: Vec<u8> = (0..150_000u32)
+            .map(|i| (i.wrapping_mul(31)) as u8)
+            .collect();
+        let b_to_a: Vec<u8> = (0..150_000u32)
+            .map(|i| (i.wrapping_mul(17).wrapping_add(5)) as u8)
+            .collect();
 
         // Split each endpoint into independent read/write halves so a single
         // NoiseStream is genuinely read from and written to at the same time —
@@ -575,21 +573,31 @@ mod tests {
             assert!(text.contains(&format!("msg-{i:04}")), "missing msg-{i:04}");
         }
         // Order must be preserved.
-        assert!(text.starts_with("msg-0000msg-0001"), "ordering broken: {}", &text[..32]);
+        assert!(
+            text.starts_with("msg-0000msg-0001"),
+            "ordering broken: {}",
+            &text[..32]
+        );
     }
 
     // ── decode_private_key validation (H1) ───────────────────────────────────
 
     #[test]
     fn decode_private_key_rejects_empty() {
-        assert!(decode_private_key("").is_err(), "empty key must be rejected");
+        assert!(
+            decode_private_key("").is_err(),
+            "empty key must be rejected"
+        );
     }
 
     #[test]
     fn decode_private_key_rejects_wrong_length() {
         // base64 of 3 bytes — valid base64, wrong key length.
         let short = B64.encode([1u8, 2, 3]);
-        assert!(decode_private_key(&short).is_err(), "wrong-length key must be rejected");
+        assert!(
+            decode_private_key(&short).is_err(),
+            "wrong-length key must be rejected"
+        );
     }
 
     #[test]

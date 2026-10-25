@@ -37,9 +37,18 @@ mod tests {
 
     #[test]
     fn shard_id_in_range() {
-        for key in &["", "a", "object1", "very/long/key/path/with/slashes", "unicode-🦀"] {
+        for key in &[
+            "",
+            "a",
+            "object1",
+            "very/long/key/path/with/slashes",
+            "unicode-🦀",
+        ] {
             let id = compute_shard_id(key);
-            assert!((0..NUM_SHARDS).contains(&id), "shard_id {id} out of range for key {key:?}");
+            assert!(
+                (0..NUM_SHARDS).contains(&id),
+                "shard_id {id} out of range for key {key:?}"
+            );
         }
     }
 

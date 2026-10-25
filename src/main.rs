@@ -1,30 +1,30 @@
-use s3s::service::S3ServiceBuilder;
-use std::sync::Arc;
-use tracing::{info, error, warn};
-use std::net::SocketAddr;
-use clap::Parser;
-use hyper::{Request, Response, StatusCode, body::Incoming};
-use http_body_util::Full;
 use bytes::Bytes;
-use serde::{Serialize, Deserialize};
+use clap::Parser;
+use http_body_util::Full;
 use hyper::service::Service;
+use hyper::{Request, Response, StatusCode, body::Incoming};
+use s3s::service::S3ServiceBuilder;
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tracing::{error, info, warn};
 
 mod chunking;
+mod clock;
 mod config;
 mod db;
+mod disk;
 mod hashing;
 mod integrity;
+mod noise_transport;
 mod storage;
 mod store;
-mod disk;
-mod clock;
-mod noise_transport;
 #[cfg(test)]
 mod wire_tests;
 
-use noise_transport::{NoiseStream, derive_psk, decode_private_key, generate_private_key};
+use noise_transport::{NoiseStream, decode_private_key, derive_psk, generate_private_key};
 
 #[derive(Parser, Debug)]
 #[command(name = "shardscape", author, version, about = "Self-hosted multi-site S3 with global dedup", long_about = None)]
@@ -136,7 +136,10 @@ fn build_site_config(site: &SiteArgs, cluster_secret: String) -> anyhow::Result<
     config.server.cluster_secret = cluster_secret;
     config.server.noise_private_key = generate_private_key()?;
     config.server.clock_offset_ms = 0;
-    config.database.db_path = data_dir.join("shardscape.db").to_string_lossy().into_owned();
+    config.database.db_path = data_dir
+        .join("shardscape.db")
+        .to_string_lossy()
+        .into_owned();
     config.storage.local_location_id = site.location_id.clone();
     config.storage.backend = config::BlockBackend::Local {
         path: data_dir.join("blocks").to_string_lossy().into_owned(),
@@ -168,7 +171,12 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Init(args) => run_init(args).await,
         Command::Serve { config } => run_server(config, None, None).await,
-        Command::Join { peer, secret, config, site } => {
+        Command::Join {
+            peer,
+            secret,
+            config,
+            site,
+        } => {
             // Create the joining site's config from flags if it doesn't exist yet
             // (no admin bootstrap — the admin user replicates in from the cluster).
             if !std::path::Path::new(&config).exists() {
@@ -179,8 +187,13 @@ async fn main() -> anyhow::Result<()> {
             run_server(config, Some(peer), Some(secret)).await
         }
         Command::Status { config } => run_status(config).await,
-        Command::CreateUser { config, access_key, secret_key, preset, bucket } =>
-            run_create_user(config, access_key, secret_key, preset, bucket).await,
+        Command::CreateUser {
+            config,
+            access_key,
+            secret_key,
+            preset,
+            bucket,
+        } => run_create_user(config, access_key, secret_key, preset, bucket).await,
         Command::RenderK8s { config, out } => run_render_k8s(config, out).await,
     }
 }
@@ -191,7 +204,10 @@ async fn run_server(
     secret_override: Option<String>,
 ) -> anyhow::Result<()> {
     let mut config = config::Config::load(&config_path).unwrap_or_else(|e| {
-        warn!("Config file not found or invalid at {}: {}. Using defaults.", config_path, e);
+        warn!(
+            "Config file not found or invalid at {}: {}. Using defaults.",
+            config_path, e
+        );
         config::Config::default()
     });
 
@@ -202,35 +218,55 @@ async fn run_server(
     // Generate a noise keypair on first boot and persist it.
     if config.server.noise_private_key.is_empty() {
         let key = generate_private_key()?;
-        info!("Generated new Noise keypair — persisting to {}", config_path);
+        info!(
+            "Generated new Noise keypair — persisting to {}",
+            config_path
+        );
         config.server.noise_private_key = key;
         config.save(&config_path)?;
     }
     let noise_private_key = decode_private_key(&config.server.noise_private_key)?;
     let psk = derive_psk(&config.server.cluster_secret);
 
-    info!("Starting shardscape node ({})", config.storage.local_location_id);
+    info!(
+        "Starting shardscape node ({})",
+        config.storage.local_location_id
+    );
 
     let clock = Arc::new(clock::ClusterClock::new(config.server.clock_offset_ms));
     if config.server.clock_offset_ms != 0 {
-        info!("Initialized clock with offset: {}ms", config.server.clock_offset_ms);
+        info!(
+            "Initialized clock with offset: {}ms",
+            config.server.clock_offset_ms
+        );
     }
 
     // Persistent Join Handshake
     let joined_peer = if let Some(peer_url) = join {
         info!("Joining cluster via {}...", peer_url);
-        let peer = perform_join_handshake(&peer_url, &mut config, &clock, &config_path, &noise_private_key, &psk).await?;
+        let peer = perform_join_handshake(
+            &peer_url,
+            &mut config,
+            &clock,
+            &config_path,
+            &noise_private_key,
+            &psk,
+        )
+        .await?;
         info!("Joined cluster; existing data will backfill via fact-log sync.");
         Some(peer)
     } else {
         None
     };
 
-    let db = Arc::new(db::Db::new(
-        &config.database.db_path,
-        config.storage.local_location_id.clone(),
-        clock.clone()
-    ).await?);
+    let db = Arc::new(
+        db::Db::new(
+            &config.database.db_path,
+            config.storage.local_location_id.clone(),
+            clock.clone(),
+        )
+        .await?,
+    );
 
     // Record self + (if we just joined) the peer we joined, so the fact-sync and
     // membership-gossip tasks have somewhere to start.
@@ -256,7 +292,10 @@ async fn run_server(
         }
         let mut parts = Vec::new();
         if backend.disk_guard.free_space_enabled() {
-            parts.push(format!("reserve {}", disk::format_bytes(backend.disk_guard.min_free_bytes())));
+            parts.push(format!(
+                "reserve {}",
+                disk::format_bytes(backend.disk_guard.min_free_bytes())
+            ));
         }
         if backend.disk_guard.quota_enabled() {
             parts.push(format!(
@@ -266,7 +305,10 @@ async fn run_server(
             ));
         }
         if backend.disk_guard.free_space_enabled() {
-            parts.push(format!("{} free now", disk::format_bytes(backend.disk_guard.free_bytes())));
+            parts.push(format!(
+                "{} free now",
+                disk::format_bytes(backend.disk_guard.free_bytes())
+            ));
         }
         info!("Disk write guard: {}", parts.join(", "));
         backend.disk_guard.spawn_refresher(Duration::from_secs(15));
@@ -291,7 +333,15 @@ async fn run_server(
                         peers.choose(&mut rand::thread_rng()).cloned()
                     };
                     if let Some((id, url)) = peer {
-                        match refresh_clock_offset(&url, &clock_sync_config, &clock_sync_clock, &clock_sync_key, &clock_sync_psk).await {
+                        match refresh_clock_offset(
+                            &url,
+                            &clock_sync_config,
+                            &clock_sync_clock,
+                            &clock_sync_key,
+                            &clock_sync_psk,
+                        )
+                        .await
+                        {
                             Ok(_) => peer_link_ok(&id),
                             Err(e) => peer_link_failed(&id, "clock sync", e),
                         }
@@ -384,7 +434,9 @@ async fn run_server(
     });
 
     let mut service = S3ServiceBuilder::new((*backend).clone());
-    service.set_auth(storage::ShardscapeAuth { db: Arc::clone(&db) });
+    service.set_auth(storage::ShardscapeAuth {
+        db: Arc::clone(&db),
+    });
     let s3 = service.build();
     let s3_shared = Arc::new(s3);
 
@@ -402,7 +454,10 @@ async fn run_server(
         loop {
             let (stream, _) = match internal_listener.accept().await {
                 Ok(s) => s,
-                Err(e) => { error!("Internal accept error: {e}"); continue; }
+                Err(e) => {
+                    error!("Internal accept error: {e}");
+                    continue;
+                }
             };
             let secret = internal_secret.clone();
             let clock_ref = internal_clock.clone();
@@ -413,7 +468,10 @@ async fn run_server(
             tokio::spawn(async move {
                 let noise_stream = match NoiseStream::accept(stream, &key, &psk_ref).await {
                     Ok(s) => s,
-                    Err(e) => { warn!("Noise handshake failed: {e}"); return; }
+                    Err(e) => {
+                        warn!("Noise handshake failed: {e}");
+                        return;
+                    }
                 };
                 let io = hyper_util::rt::TokioIo::new(noise_stream);
 
@@ -426,9 +484,11 @@ async fn run_server(
                     }
                 });
 
-                if let Err(err) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(io, service_fn)
-                    .await
+                if let Err(err) = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(io, service_fn)
+                .await
                 {
                     error!("Internal connection error: {}", err);
                 }
@@ -463,9 +523,10 @@ async fn run_server(
                     Ok::<_, anyhow::Error>(storage::log_server_error(&method, &uri, res).await)
                 }
             });
-            if let Err(err) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                .serve_connection(io, service_fn)
-                .await
+            if let Err(err) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(io, service_fn)
+                    .await
             {
                 error!("S3 connection error: {}", err);
             }
@@ -482,7 +543,8 @@ async fn handle_internal_request(
     // After noise, we still check the secret header as a defence-in-depth
     // sanity check (protects against misconfigured noise keys letting a
     // wrong peer in).
-    let provided_secret = req.headers()
+    let provided_secret = req
+        .headers()
         .get("X-Shardscape-Secret")
         .and_then(|h| h.to_str().ok());
 
@@ -490,7 +552,9 @@ async fn handle_internal_request(
         warn!("Internal request missing or wrong secret (post-noise)");
         return Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
-            .body(http_body_util::Either::Left(Full::new(Bytes::from("Unauthorized"))))
+            .body(http_body_util::Either::Left(Full::new(Bytes::from(
+                "Unauthorized",
+            ))))
             .unwrap());
     }
 
@@ -506,7 +570,9 @@ async fn handle_internal_request(
                 error!("Failed to serialize cluster config: {}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(http_body_util::Either::Left(Full::new(Bytes::from("Internal error"))))
+                    .body(http_body_util::Either::Left(Full::new(Bytes::from(
+                        "Internal error",
+                    ))))
                     .unwrap());
             }
         };
@@ -560,7 +626,10 @@ async fn handle_internal_request(
     if let Some(after_str) = req.uri().path().strip_prefix("/internal/facts/") {
         let after: i64 = after_str.parse().unwrap_or(0);
         let facts = match &backend.db {
-            Some(db) => db.facts_since(after, FACT_SYNC_BATCH).await.unwrap_or_default(),
+            Some(db) => db
+                .facts_since(after, FACT_SYNC_BATCH)
+                .await
+                .unwrap_or_default(),
             None => Vec::new(),
         };
         let body = match serde_json::to_vec(&facts) {
@@ -569,7 +638,9 @@ async fn handle_internal_request(
                 error!("Failed to serialize facts: {}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(http_body_util::Either::Left(Full::new(Bytes::from("Internal error"))))
+                    .body(http_body_util::Either::Left(Full::new(Bytes::from(
+                        "Internal error",
+                    ))))
                     .unwrap());
             }
         };
@@ -593,7 +664,9 @@ async fn handle_internal_request(
                 error!("Forced GC sweep failed: {}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(http_body_util::Either::Left(Full::new(Bytes::from("sweep failed"))))
+                    .body(http_body_util::Either::Left(Full::new(Bytes::from(
+                        "sweep failed",
+                    ))))
                     .unwrap());
             }
         }
@@ -603,14 +676,22 @@ async fn handle_internal_request(
         let hash_hex = &req.uri().path()["/internal/blocks/".len()..];
         let hash = match hex::decode(hash_hex) {
             Ok(h) if h.len() == 32 => h,
-            Ok(_) => return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(http_body_util::Either::Left(Full::new(Bytes::from("Hash must be 32 bytes"))))
-                .unwrap()),
-            Err(_) => return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(http_body_util::Either::Left(Full::new(Bytes::from("Invalid hash"))))
-                .unwrap()),
+            Ok(_) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(http_body_util::Either::Left(Full::new(Bytes::from(
+                        "Hash must be 32 bytes",
+                    ))))
+                    .unwrap());
+            }
+            Err(_) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(http_body_util::Either::Left(Full::new(Bytes::from(
+                        "Invalid hash",
+                    ))))
+                    .unwrap());
+            }
         };
 
         return match backend.blocks.get_block(&hash).await {
@@ -620,14 +701,18 @@ async fn handle_internal_request(
                 .unwrap()),
             Err(_) => Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
-                .body(http_body_util::Either::Left(Full::new(Bytes::from("Not found"))))
+                .body(http_body_util::Either::Left(Full::new(Bytes::from(
+                    "Not found",
+                ))))
                 .unwrap()),
         };
     }
 
     Ok(Response::builder()
         .status(StatusCode::NOT_FOUND)
-        .body(http_body_util::Either::Left(Full::new(Bytes::from("Not found"))))
+        .body(http_body_util::Either::Left(Full::new(Bytes::from(
+            "Not found",
+        ))))
         .unwrap())
 }
 
@@ -654,10 +739,17 @@ async fn noise_connect(
         .trim_start_matches("https://");
     let stream = timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(host_port))
         .await
-        .map_err(|_| anyhow::anyhow!("TCP connect to {host_port} timed out after {PEER_CONNECT_TIMEOUT:?}"))??;
-    timeout(PEER_CONNECT_TIMEOUT, NoiseStream::connect(stream, private_key, psk))
-        .await
-        .map_err(|_| anyhow::anyhow!("Noise handshake with {host_port} timed out after {PEER_CONNECT_TIMEOUT:?}"))?
+        .map_err(|_| {
+            anyhow::anyhow!("TCP connect to {host_port} timed out after {PEER_CONNECT_TIMEOUT:?}")
+        })??;
+    timeout(
+        PEER_CONNECT_TIMEOUT,
+        NoiseStream::connect(stream, private_key, psk),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("Noise handshake with {host_port} timed out after {PEER_CONNECT_TIMEOUT:?}")
+    })?
 }
 
 /// Make a JSON GET request over a noise-encrypted connection.
@@ -679,7 +771,8 @@ async fn noise_get_json(
     // Bound the whole request/response so a peer that stalls after the handshake
     // cannot hang the clock-sync loop indefinitely.
     tokio::time::timeout(PEER_REQUEST_TIMEOUT, async {
-        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, http_body_util::Empty<Bytes>>(io).await?;
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake::<_, http_body_util::Empty<Bytes>>(io).await?;
         tokio::spawn(conn);
 
         let start = std::time::Instant::now();
@@ -697,12 +790,16 @@ async fn noise_get_json(
             anyhow::bail!("Server returned {}", res.status());
         }
 
-        let body = http_body_util::BodyExt::collect(res.into_body()).await?.to_bytes();
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await?
+            .to_bytes();
         let parsed: ClusterConfigResponse = serde_json::from_slice(&body)?;
         Ok::<_, anyhow::Error>((parsed, rtt))
     })
     .await
-    .map_err(|_| anyhow::anyhow!("Clock-sync request to {host} timed out after {PEER_REQUEST_TIMEOUT:?}"))?
+    .map_err(|_| {
+        anyhow::anyhow!("Clock-sync request to {host} timed out after {PEER_REQUEST_TIMEOUT:?}")
+    })?
 }
 
 /// Fetches a peer's own-originated facts after `after`, over Noise. The peer
@@ -739,12 +836,16 @@ async fn noise_get_facts(
         if !res.status().is_success() {
             anyhow::bail!("Fact pull returned {}", res.status());
         }
-        let body = http_body_util::BodyExt::collect(res.into_body()).await?.to_bytes();
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await?
+            .to_bytes();
         let facts: Vec<store::FactRecord> = serde_json::from_slice(&body)?;
         Ok::<_, anyhow::Error>(facts)
     })
     .await
-    .map_err(|_| anyhow::anyhow!("Fact pull from {host} timed out after {PEER_REQUEST_TIMEOUT:?}"))?
+    .map_err(|_| {
+        anyhow::anyhow!("Fact pull from {host} timed out after {PEER_REQUEST_TIMEOUT:?}")
+    })?
 }
 
 /// Pulls and applies new facts from every live peer once. Per-peer failures are
@@ -761,11 +862,20 @@ async fn sync_facts_once(
         loop {
             let after = match db.get_cursor(&peer_id).await {
                 Ok(c) => c,
-                Err(e) => { warn!("Fact sync: cursor read for {peer_id} failed: {e}"); break; }
+                Err(e) => {
+                    warn!("Fact sync: cursor read for {peer_id} failed: {e}");
+                    break;
+                }
             };
             let facts = match noise_get_facts(&peer_url, after, secret, private_key, psk).await {
-                Ok(f) => { peer_link_ok(&peer_id); f }
-                Err(e) => { peer_link_failed(&peer_id, "fact sync", e); break; }
+                Ok(f) => {
+                    peer_link_ok(&peer_id);
+                    f
+                }
+                Err(e) => {
+                    peer_link_failed(&peer_id, "fact sync", e);
+                    break;
+                }
             };
             if facts.is_empty() {
                 break;
@@ -774,7 +884,10 @@ async fn sync_facts_once(
             let mut applied = 0usize;
             for f in &facts {
                 if let Err(e) = db.apply_fact(f).await {
-                    warn!("Fact sync: apply (seq {}) from {peer_id} failed: {e}", f.seq);
+                    warn!(
+                        "Fact sync: apply (seq {}) from {peer_id} failed: {e}",
+                        f.seq
+                    );
                     continue;
                 }
                 max_seq = max_seq.max(f.seq);
@@ -784,7 +897,9 @@ async fn sync_facts_once(
                 warn!("Fact sync: cursor advance for {peer_id} failed: {e}");
                 break;
             }
-            tracing::debug!("Fact sync: applied {applied} fact(s) from {peer_id} (cursor → {max_seq})");
+            tracing::debug!(
+                "Fact sync: applied {applied} fact(s) from {peer_id} (cursor → {max_seq})"
+            );
             // A short page means we've caught up; a full page means keep draining.
             if (facts.len() as i64) < FACT_SYNC_BATCH {
                 break;
@@ -806,7 +921,8 @@ async fn refresh_clock_offset(
         &config.server.cluster_secret,
         private_key,
         psk,
-    ).await?;
+    )
+    .await?;
 
     let local_now_micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -818,7 +934,10 @@ async fn refresh_clock_offset(
 
     let old_offset = clock.get_offset();
     if (offset_ms - old_offset).abs() > 10 {
-        info!("Updating clock offset: {}ms -> {}ms (drift detected)", old_offset, offset_ms);
+        info!(
+            "Updating clock offset: {}ms -> {}ms (drift detected)",
+            old_offset, offset_ms
+        );
         clock.set_offset(offset_ms);
     }
 
@@ -845,7 +964,8 @@ async fn perform_join_handshake(
         &config.server.cluster_secret,
         private_key,
         psk,
-    ).await?;
+    )
+    .await?;
 
     let local_now_micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -862,7 +982,15 @@ async fn perform_join_handshake(
         "/internal/join?id={}&addr={}",
         config.storage.local_location_id, config.server.advertise_addr
     );
-    if let Err(e) = noise_get_bytes(peer_url, &register_path, &config.server.cluster_secret, private_key, psk).await {
+    if let Err(e) = noise_get_bytes(
+        peer_url,
+        &register_path,
+        &config.server.cluster_secret,
+        private_key,
+        psk,
+    )
+    .await
+    {
         warn!("Could not register self at peer (will still sync once peer learns us): {e}");
     }
 
@@ -912,7 +1040,12 @@ async fn noise_get_bytes(
         if !res.status().is_success() {
             anyhow::bail!("Peer returned {}", res.status());
         }
-        Ok::<_, anyhow::Error>(http_body_util::BodyExt::collect(res.into_body()).await?.to_bytes().to_vec())
+        Ok::<_, anyhow::Error>(
+            http_body_util::BodyExt::collect(res.into_body())
+                .await?
+                .to_bytes()
+                .to_vec(),
+        )
     })
     .await
     .map_err(|_| anyhow::anyhow!("Request to {host} timed out after {PEER_REQUEST_TIMEOUT:?}"))?
@@ -921,20 +1054,29 @@ async fn noise_get_bytes(
 /// Per-peer link state for edge-triggered logging: periodic loops (membership
 /// gossip, fact sync, clock sync) log once when a peer becomes unreachable and
 /// once when it recovers, instead of on every heartbeat. Repeats are debug-level.
-static PEER_LINK_UP: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
-    std::sync::LazyLock::new(Default::default);
+static PEER_LINK_UP: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, bool>>,
+> = std::sync::LazyLock::new(Default::default);
 
 fn peer_link_failed(peer_id: &str, context: &str, err: impl std::fmt::Display) {
-    let was_up = PEER_LINK_UP.lock().unwrap().insert(peer_id.to_string(), false);
+    let was_up = PEER_LINK_UP
+        .lock()
+        .unwrap()
+        .insert(peer_id.to_string(), false);
     if was_up != Some(false) {
-        warn!("Peer {peer_id} unreachable ({context}): {err} — suppressing repeats until it recovers");
+        warn!(
+            "Peer {peer_id} unreachable ({context}): {err} — suppressing repeats until it recovers"
+        );
     } else {
         tracing::debug!("Peer {peer_id} still unreachable ({context}): {err}");
     }
 }
 
 fn peer_link_ok(peer_id: &str) {
-    let was_up = PEER_LINK_UP.lock().unwrap().insert(peer_id.to_string(), true);
+    let was_up = PEER_LINK_UP
+        .lock()
+        .unwrap()
+        .insert(peer_id.to_string(), true);
     if was_up == Some(false) {
         info!("Peer {peer_id} reachable again");
     }
@@ -1024,8 +1166,9 @@ mod cli_tests {
 
 async fn bootstrap_admin_user(db: &db::Db) -> anyhow::Result<()> {
     if db.get_user("admin").await?.is_none() {
-        let password = std::env::var("SS_ADMIN_PASSWORD")
-            .map_err(|_| anyhow::anyhow!("SS_ADMIN_PASSWORD env var must be set for initial bootstrap"))?;
+        let password = std::env::var("SS_ADMIN_PASSWORD").map_err(|_| {
+            anyhow::anyhow!("SS_ADMIN_PASSWORD env var must be set for initial bootstrap")
+        })?;
         info!("Bootstrapping admin user...");
         db.create_user("admin", &password, &admin_policy()).await?;
     }
@@ -1059,7 +1202,10 @@ async fn run_init(args: InitArgs) -> anyhow::Result<()> {
             args.config
         );
     }
-    let cluster_secret = args.cluster_secret.clone().unwrap_or_else(|| random_hex(32));
+    let cluster_secret = args
+        .cluster_secret
+        .clone()
+        .unwrap_or_else(|| random_hex(32));
     let admin_password = random_hex(24);
 
     let config = build_site_config(&args.site, cluster_secret.clone())?;
@@ -1068,10 +1214,19 @@ async fn run_init(args: InitArgs) -> anyhow::Result<()> {
     // Bootstrap the admin user directly into the new store so `serve` needs no
     // SS_ADMIN_PASSWORD. Joining sites receive admin via fact-log replication.
     let clock = Arc::new(clock::ClusterClock::new(0));
-    let db = db::Db::new(&config.database.db_path, args.site.location_id.clone(), clock).await?;
-    db.create_user("admin", &admin_password, &admin_policy()).await?;
+    let db = db::Db::new(
+        &config.database.db_path,
+        args.site.location_id.clone(),
+        clock,
+    )
+    .await?;
+    db.create_user("admin", &admin_password, &admin_policy())
+        .await?;
 
-    println!("\n  Shardscape site '{}' initialised.\n", args.site.location_id);
+    println!(
+        "\n  Shardscape site '{}' initialised.\n",
+        args.site.location_id
+    );
     println!("  config:           {}", args.config);
     println!("  data dir:         {}", args.site.data_dir);
     println!("  S3 endpoint:      http://{}", config.server.s3_bind_addr);
@@ -1080,8 +1235,14 @@ async fn run_init(args: InitArgs) -> anyhow::Result<()> {
     println!("  Admin secret key: {admin_password}");
     println!("  Cluster secret:   {cluster_secret}");
     println!();
-    println!("  Start this node:  shardscape serve --config {}", args.config);
-    println!("  Add another site: shardscape join {} --secret {}", config.server.advertise_addr, cluster_secret);
+    println!(
+        "  Start this node:  shardscape serve --config {}",
+        args.config
+    );
+    println!(
+        "  Add another site: shardscape join {} --secret {}",
+        config.server.advertise_addr, cluster_secret
+    );
     println!();
     Ok(())
 }
@@ -1117,7 +1278,10 @@ async fn run_create_user(
     db.create_user(&access_key, &secret, &policy).await?;
 
     let scope = bucket.as_deref().unwrap_or("all buckets");
-    println!("\n  User '{}' created ({} on {}).\n", access_key, preset, scope);
+    println!(
+        "\n  User '{}' created ({} on {}).\n",
+        access_key, preset, scope
+    );
     println!("  Access key: {access_key}");
     println!("  Secret key: {secret}");
     println!();
@@ -1185,9 +1349,16 @@ async fn run_status(config_path: String) -> anyhow::Result<()> {
     let peers = db.get_peers().await?;
 
     println!("Shardscape site '{}'", config.storage.local_location_id);
-    println!("  S3 endpoint:        http://{}", config.server.s3_bind_addr);
+    println!(
+        "  S3 endpoint:        http://{}",
+        config.server.s3_bind_addr
+    );
     println!("  live objects:       {}", stats.live_objects);
-    println!("  local blocks:       {} ({})", stats.local_blocks, disk::format_bytes(stats.local_block_bytes as u64));
+    println!(
+        "  local blocks:       {} ({})",
+        stats.local_blocks,
+        disk::format_bytes(stats.local_block_bytes as u64)
+    );
     println!("  blocks to pull:     {}", stats.pending_pulls);
     println!("  pending GC:         {}", stats.pending_deletions);
     println!("  fact-log length:    {}", stats.fact_count);
@@ -1198,7 +1369,10 @@ async fn run_status(config_path: String) -> anyhow::Result<()> {
         None => {
             let mut parts = Vec::new();
             if guard.free_space_enabled() {
-                parts.push(format!("reserve {}", disk::format_bytes(guard.min_free_bytes())));
+                parts.push(format!(
+                    "reserve {}",
+                    disk::format_bytes(guard.min_free_bytes())
+                ));
             }
             if guard.quota_enabled() {
                 parts.push(format!("cap {}", disk::format_bytes(guard.max_bytes())));
@@ -1206,14 +1380,24 @@ async fn run_status(config_path: String) -> anyhow::Result<()> {
             format!("OK, {}", parts.join(", "))
         }
         Some(disk::GuardTrip::LowFreeSpace) => {
-            format!("TRIPPED — writes refused (reserve {})", disk::format_bytes(guard.min_free_bytes()))
+            format!(
+                "TRIPPED — writes refused (reserve {})",
+                disk::format_bytes(guard.min_free_bytes())
+            )
         }
         Some(disk::GuardTrip::OverQuota) => {
-            format!("TRIPPED — writes refused (cap {})", disk::format_bytes(guard.max_bytes()))
+            format!(
+                "TRIPPED — writes refused (cap {})",
+                disk::format_bytes(guard.max_bytes())
+            )
         }
     };
     if guard.free_space_enabled() {
-        println!("  disk free:          {} (guard: {})", disk::format_bytes(guard.free_bytes()), guard_state);
+        println!(
+            "  disk free:          {} (guard: {})",
+            disk::format_bytes(guard.free_bytes()),
+            guard_state
+        );
     } else {
         println!("  disk guard:         {}", guard_state);
     }
@@ -1244,8 +1428,18 @@ async fn run_render_k8s(config_path: String, out: Option<String>) -> anyhow::Res
 
 fn render_k8s_manifests(config: &config::Config) -> String {
     let site = &config.storage.local_location_id;
-    let s3_port = config.server.s3_bind_addr.rsplit(':').next().unwrap_or("8014");
-    let internal_port = config.server.internal_bind_addr.rsplit(':').next().unwrap_or("8015");
+    let s3_port = config
+        .server
+        .s3_bind_addr
+        .rsplit(':')
+        .next()
+        .unwrap_or("8014");
+    let internal_port = config
+        .server
+        .internal_bind_addr
+        .rsplit(':')
+        .next()
+        .unwrap_or("8015");
     // The cluster secret is the only sensitive value; everything else is plain
     // config. We reference it from a Secret the operator creates out-of-band so
     // it never lands in a committed manifest.

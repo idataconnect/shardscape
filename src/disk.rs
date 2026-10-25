@@ -16,8 +16,8 @@
 //! background task, so the hot write path is a single atomic load.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -102,7 +102,7 @@ pub struct DiskGuard {
     path: PathBuf,
     min_free_bytes: u64, // 0 = disabled
     free: Arc<AtomicU64>,
-    max_bytes: u64,      // 0 = disabled
+    max_bytes: u64, // 0 = disabled
     local_usage: Arc<AtomicU64>,
 }
 
@@ -276,7 +276,10 @@ mod tests {
         assert_eq!(parse_size("500Mi").unwrap(), 500 * 1024 * 1024);
         assert_eq!(parse_size("1Ti").unwrap(), 1024u64.pow(4));
         assert_eq!(parse_size("2GB").unwrap(), 2_000_000_000);
-        assert_eq!(parse_size("1.5Gi").unwrap(), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+        assert_eq!(
+            parse_size("1.5Gi").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
         assert!(parse_size("").is_err());
         assert!(parse_size("10Xy").is_err());
         assert!(parse_size("abc").is_err());

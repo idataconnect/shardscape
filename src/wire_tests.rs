@@ -43,10 +43,16 @@ async fn harness() -> Harness {
     };
     config.storage.min_free_bytes = None;
     // Small blocks so every object spans several blocks.
-    config.storage.chunking = crate::config::ChunkingConfig::Fixed { max_block_size: 100 * 1024 };
+    config.storage.chunking = crate::config::ChunkingConfig::Fixed {
+        max_block_size: 100 * 1024,
+    };
 
     let clock = Arc::new(crate::clock::ClusterClock::new(0));
-    let db = Arc::new(crate::store::Store::new(":memory:", "test-site".to_string(), clock).await.unwrap());
+    let db = Arc::new(
+        crate::store::Store::new(":memory:", "test-site".to_string(), clock)
+            .await
+            .unwrap(),
+    );
     let allow_all = crate::db::Policy {
         statements: vec![crate::db::PolicyStatement {
             effect: "Allow".to_string(),
@@ -54,18 +60,26 @@ async fn harness() -> Harness {
             resources: vec!["*".to_string()],
         }],
     };
-    db.create_user(ACCESS_KEY, SECRET_KEY, &allow_all).await.unwrap();
+    db.create_user(ACCESS_KEY, SECRET_KEY, &allow_all)
+        .await
+        .unwrap();
 
     let backend = StorageBackend::new(Arc::clone(&db), config);
     let mut builder = S3ServiceBuilder::new(backend);
     builder.set_auth(ShardscapeAuth { db });
-    Harness { svc: builder.build(), blocks_dir }
+    Harness {
+        svc: builder.build(),
+        blocks_dir,
+    }
 }
 
 /// The current time as an `x-amz-date` (`YYYYMMDDTHHMMSSZ`); s3s rejects
 /// requests too far from now.
 fn amz_now() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // Civil-from-days (Howard Hinnant), proleptic Gregorian.
     let z = days + 719_468;
@@ -77,7 +91,12 @@ fn amz_now() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+    format!(
+        "{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -97,25 +116,41 @@ enum Wire {
     /// A plain body with its SHA-256 in `x-amz-content-sha256`.
     Plain(Vec<u8>),
     /// `STREAMING-UNSIGNED-PAYLOAD-TRAILER`: aws-cli's default since 2025.
-    UnsignedTrailer { data: Vec<u8>, trailer: (&'static str, String) },
+    UnsignedTrailer {
+        data: Vec<u8>,
+        trailer: (&'static str, String),
+    },
     /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`: signed chunks and trailer.
-    SignedTrailer { data: Vec<u8>, trailer: (&'static str, String) },
+    SignedTrailer {
+        data: Vec<u8>,
+        trailer: (&'static str, String),
+    },
 }
 
 /// Build a SigV4-signed request the way an AWS SDK would.
-fn request(method: Method, path: &str, query: &[(&str, &str)], extra: &[(&str, &str)], body: Wire) -> s3s::HttpRequest {
+fn request(
+    method: Method,
+    path: &str,
+    query: &[(&str, &str)],
+    extra: &[(&str, &str)],
+    body: Wire,
+) -> s3s::HttpRequest {
     let amz_date = amz_now();
     let date = AmzDate::parse(&amz_date).unwrap();
     let date8 = &amz_date[..8];
 
     let (content_sha256, decoded_len, trailer_name) = match &body {
         Wire::Plain(d) => (sha256_hex(d), None, None),
-        Wire::UnsignedTrailer { data, trailer } => {
-            ("STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(), Some(data.len()), Some(trailer.0))
-        }
-        Wire::SignedTrailer { data, trailer } => {
-            ("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER".to_string(), Some(data.len()), Some(trailer.0))
-        }
+        Wire::UnsignedTrailer { data, trailer } => (
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
+            Some(data.len()),
+            Some(trailer.0),
+        ),
+        Wire::SignedTrailer { data, trailer } => (
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER".to_string(),
+            Some(data.len()),
+            Some(trailer.0),
+        ),
     };
 
     let mut headers: Vec<(String, String)> = vec![
@@ -140,7 +175,10 @@ fn request(method: Method, path: &str, query: &[(&str, &str)], extra: &[(&str, &
         Wire::UnsignedTrailer { .. } => Payload::UnsignedMultipleChunksWithTrailer,
         Wire::SignedTrailer { .. } => Payload::MultipleChunksWithTrailer,
     };
-    let signed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let signed: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     let canonical = create_canonical_request(method.as_str(), path, query, &signed, payload);
     let sts = create_string_to_sign(&canonical, &date, REGION, "s3");
     let seed = calculate_signature(&sts, SECRET_KEY, &date, REGION, "s3");
@@ -168,7 +206,9 @@ fn request(method: Method, path: &str, query: &[(&str, &str)], extra: &[(&str, &
             for chunk in data.chunks(CHUNK) {
                 let sts = create_chunk_string_to_sign(&date, REGION, "s3", &prev, &[chunk]);
                 prev = calculate_signature(&sts, SECRET_KEY, &date, REGION, "s3");
-                out.extend_from_slice(format!("{:x};chunk-signature={prev}\r\n", chunk.len()).as_bytes());
+                out.extend_from_slice(
+                    format!("{:x};chunk-signature={prev}\r\n", chunk.len()).as_bytes(),
+                );
                 out.extend_from_slice(chunk);
                 out.extend_from_slice(b"\r\n");
             }
@@ -177,10 +217,20 @@ fn request(method: Method, path: &str, query: &[(&str, &str)], extra: &[(&str, &
             prev = calculate_signature(&sts, SECRET_KEY, &date, REGION, "s3");
             out.extend_from_slice(format!("0;chunk-signature={prev}\r\n").as_bytes());
             let canonical_trailers = format!("{}:{}\n", trailer.0, trailer.1);
-            let sts = create_trailer_string_to_sign(&date, REGION, "s3", &prev, canonical_trailers.as_bytes());
+            let sts = create_trailer_string_to_sign(
+                &date,
+                REGION,
+                "s3",
+                &prev,
+                canonical_trailers.as_bytes(),
+            );
             let trailer_sig = calculate_signature(&sts, SECRET_KEY, &date, REGION, "s3");
             out.extend_from_slice(
-                format!("{}:{}\r\nx-amz-trailer-signature:{trailer_sig}\r\n\r\n", trailer.0, trailer.1).as_bytes(),
+                format!(
+                    "{}:{}\r\nx-amz-trailer-signature:{trailer_sig}\r\n\r\n",
+                    trailer.0, trailer.1
+                )
+                .as_bytes(),
             );
             out
         }
@@ -188,14 +238,29 @@ fn request(method: Method, path: &str, query: &[(&str, &str)], extra: &[(&str, &
 
     let qs: Vec<String> = query
         .iter()
-        .map(|(k, v)| if v.is_empty() { k.to_string() } else { format!("{k}={v}") })
+        .map(|(k, v)| {
+            if v.is_empty() {
+                k.to_string()
+            } else {
+                format!("{k}={v}")
+            }
+        })
         .collect();
-    let uri = if qs.is_empty() { path.to_string() } else { format!("{path}?{}", qs.join("&")) };
-    let mut req = Request::builder().method(method).uri(uri).header("authorization", authorization);
+    let uri = if qs.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", qs.join("&"))
+    };
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", authorization);
     for (k, v) in &headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    req.header("content-length", wire.len().to_string()).body(Body::from(wire)).unwrap()
+    req.header("content-length", wire.len().to_string())
+        .body(Body::from(wire))
+        .unwrap()
 }
 
 async fn call(h: &Harness, req: s3s::HttpRequest) -> (StatusCode, hyper::HeaderMap, Bytes) {
@@ -206,11 +271,14 @@ async fn call(h: &Harness, req: s3s::HttpRequest) -> (StatusCode, hyper::HeaderM
 }
 
 fn s3_code(body: &[u8]) -> String {
-    crate::storage::xml_text(&String::from_utf8_lossy(body), "Code").unwrap_or_default().to_string()
+    crate::storage::xml_text(&String::from_utf8_lossy(body), "Code")
+        .unwrap_or_default()
+        .to_string()
 }
 
 async fn get(h: &Harness, path: &str) -> (StatusCode, Bytes) {
-    let (status, _, body) = call(h, request(Method::GET, path, &[], &[], Wire::Plain(vec![]))).await;
+    let (status, _, body) =
+        call(h, request(Method::GET, path, &[], &[], Wire::Plain(vec![]))).await;
     (status, body)
 }
 
@@ -237,14 +305,23 @@ async fn unsigned_trailer_put_stores_and_reads_back_intact() {
         "/bucket/backups/db.sql.gz",
         &[],
         &[("x-amz-sdk-checksum-algorithm", "CRC64NVME")],
-        Wire::UnsignedTrailer { data: body.clone(), trailer: ("x-amz-checksum-crc64nvme", crc.clone()) },
+        Wire::UnsignedTrailer {
+            data: body.clone(),
+            trailer: ("x-amz-checksum-crc64nvme", crc.clone()),
+        },
     );
     let (status, headers, resp) = call(&h, req).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
     // S3 echoes the verified checksum and a quoted MD5 ETag.
-    assert_eq!(headers.get("x-amz-checksum-crc64nvme").unwrap(), crc.as_str());
+    assert_eq!(
+        headers.get("x-amz-checksum-crc64nvme").unwrap(),
+        crc.as_str()
+    );
     let md5 = hex::encode(<md5::Md5 as md5::Digest>::digest(&body));
-    assert_eq!(headers.get("etag").unwrap().to_str().unwrap(), format!("\"{md5}\""));
+    assert_eq!(
+        headers.get("etag").unwrap().to_str().unwrap(),
+        format!("\"{md5}\"")
+    );
 
     let (status, got) = get(&h, "/bucket/backups/db.sql.gz").await;
     assert_eq!(status, StatusCode::OK);
@@ -261,7 +338,10 @@ async fn signed_trailer_put_stores_and_reads_back_intact() {
         "/bucket/signed.bin",
         &[],
         &[],
-        Wire::SignedTrailer { data: body.clone(), trailer: ("x-amz-checksum-crc32c", crc.clone()) },
+        Wire::SignedTrailer {
+            data: body.clone(),
+            trailer: ("x-amz-checksum-crc32c", crc.clone()),
+        },
     );
     let (status, headers, resp) = call(&h, req).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
@@ -282,14 +362,21 @@ async fn unsigned_trailer_checksum_mismatch_is_rejected_and_not_stored() {
         "/bucket/corrupt",
         &[],
         &[],
-        Wire::UnsignedTrailer { data: body, trailer: ("x-amz-checksum-crc64nvme", wrong) },
+        Wire::UnsignedTrailer {
+            data: body,
+            trailer: ("x-amz-checksum-crc64nvme", wrong),
+        },
     );
     let (status, _, resp) = call(&h, req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(s3_code(&resp), "BadDigest");
 
     let (status, _) = get(&h, "/bucket/corrupt").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "a rejected upload must not be visible");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a rejected upload must not be visible"
+    );
 }
 
 #[tokio::test]
@@ -303,7 +390,10 @@ async fn signed_trailer_checksum_mismatch_is_rejected() {
         "/bucket/corrupt-signed",
         &[],
         &[],
-        Wire::SignedTrailer { data: body, trailer: ("x-amz-checksum-crc32c", crc32c(b"other")) },
+        Wire::SignedTrailer {
+            data: body,
+            trailer: ("x-amz-checksum-crc32c", crc32c(b"other")),
+        },
     );
     let (status, _, resp) = call(&h, req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -317,13 +407,25 @@ async fn header_checksum_mismatch_is_rejected() {
     let h = harness().await;
     let body = data(1000, 5);
     let bad = BASE64.encode(s3s::crypto::Crc32::checksum(b"x"));
-    let req = request(Method::PUT, "/bucket/h", &[], &[("x-amz-checksum-crc32", &bad)], Wire::Plain(body.clone()));
+    let req = request(
+        Method::PUT,
+        "/bucket/h",
+        &[],
+        &[("x-amz-checksum-crc32", &bad)],
+        Wire::Plain(body.clone()),
+    );
     let (status, _, resp) = call(&h, req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(s3_code(&resp), "BadDigest");
 
     let good = BASE64.encode(s3s::crypto::Crc32::checksum(&body));
-    let req = request(Method::PUT, "/bucket/h", &[], &[("x-amz-checksum-crc32", &good)], Wire::Plain(body.clone()));
+    let req = request(
+        Method::PUT,
+        "/bucket/h",
+        &[],
+        &[("x-amz-checksum-crc32", &good)],
+        Wire::Plain(body.clone()),
+    );
     let (status, _, _) = call(&h, req).await;
     assert_eq!(status, StatusCode::OK);
     assert!(get(&h, "/bucket/h").await.1 == body);
@@ -333,7 +435,17 @@ async fn header_checksum_mismatch_is_rejected() {
 async fn plain_put_without_checksums_still_works() {
     let h = harness().await;
     let body = data(4096, 6);
-    let (status, _, _) = call(&h, request(Method::PUT, "/bucket/plain", &[], &[], Wire::Plain(body.clone()))).await;
+    let (status, _, _) = call(
+        &h,
+        request(
+            Method::PUT,
+            "/bucket/plain",
+            &[],
+            &[],
+            Wire::Plain(body.clone()),
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(get(&h, "/bucket/plain").await.1 == body);
 }
@@ -343,9 +455,21 @@ async fn multipart_upload_with_trailing_checksums_round_trips() {
     let h = harness().await;
     let path = "/bucket/big/archive.tar";
 
-    let (status, _, resp) = call(&h, request(Method::POST, path, &[("uploads", "")], &[], Wire::Plain(vec![]))).await;
+    let (status, _, resp) = call(
+        &h,
+        request(
+            Method::POST,
+            path,
+            &[("uploads", "")],
+            &[],
+            Wire::Plain(vec![]),
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
-    let upload_id = crate::storage::xml_text(&String::from_utf8_lossy(&resp), "UploadId").unwrap().to_string();
+    let upload_id = crate::storage::xml_text(&String::from_utf8_lossy(&resp), "UploadId")
+        .unwrap()
+        .to_string();
 
     // Part 1 unsigned-trailer (aws-cli's default), part 2 signed-trailer.
     let part1 = data(256 * 1024, 7);
@@ -355,11 +479,17 @@ async fn multipart_upload_with_trailing_checksums_round_trips() {
         path,
         &[("partNumber", "1"), ("uploadId", &upload_id)],
         &[],
-        Wire::UnsignedTrailer { data: part1.clone(), trailer: ("x-amz-checksum-crc64nvme", crc64nvme(&part1)) },
+        Wire::UnsignedTrailer {
+            data: part1.clone(),
+            trailer: ("x-amz-checksum-crc64nvme", crc64nvme(&part1)),
+        },
     );
     let (status, headers1, resp) = call(&h, req).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
-    assert_eq!(headers1.get("x-amz-checksum-crc64nvme").unwrap(), crc64nvme(&part1).as_str());
+    assert_eq!(
+        headers1.get("x-amz-checksum-crc64nvme").unwrap(),
+        crc64nvme(&part1).as_str()
+    );
 
     // A corrupted retry of part 2 is rejected...
     let req = request(
@@ -367,7 +497,10 @@ async fn multipart_upload_with_trailing_checksums_round_trips() {
         path,
         &[("partNumber", "2"), ("uploadId", &upload_id)],
         &[],
-        Wire::UnsignedTrailer { data: part2.clone(), trailer: ("x-amz-checksum-crc64nvme", crc64nvme(&part1)) },
+        Wire::UnsignedTrailer {
+            data: part2.clone(),
+            trailer: ("x-amz-checksum-crc64nvme", crc64nvme(&part1)),
+        },
     );
     let (status, _, resp) = call(&h, req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -379,7 +512,10 @@ async fn multipart_upload_with_trailing_checksums_round_trips() {
         path,
         &[("partNumber", "2"), ("uploadId", &upload_id)],
         &[],
-        Wire::SignedTrailer { data: part2.clone(), trailer: ("x-amz-checksum-crc32c", crc32c(&part2)) },
+        Wire::SignedTrailer {
+            data: part2.clone(),
+            trailer: ("x-amz-checksum-crc32c", crc32c(&part2)),
+        },
     );
     let (status, headers2, resp) = call(&h, req).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
@@ -393,7 +529,13 @@ async fn multipart_upload_with_trailing_checksums_round_trips() {
         etag(&headers1),
         etag(&headers2)
     );
-    let req = request(Method::POST, path, &[("uploadId", &upload_id)], &[], Wire::Plain(complete.into_bytes()));
+    let req = request(
+        Method::POST,
+        path,
+        &[("uploadId", &upload_id)],
+        &[],
+        Wire::Plain(complete.into_bytes()),
+    );
     let (status, _, resp) = call(&h, req).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
 
@@ -401,24 +543,38 @@ async fn multipart_upload_with_trailing_checksums_round_trips() {
     assert_eq!(status, StatusCode::OK);
     let mut want = part1;
     want.extend_from_slice(&part2);
-    assert!(got == want, "multipart object differs from the concatenated parts");
+    assert!(
+        got == want,
+        "multipart object differs from the concatenated parts"
+    );
 }
 
 #[tokio::test]
 async fn server_errors_pass_through_logging_unchanged() {
     let xml = "<?xml version=\"1.0\"?><Error><Code>InternalError</Code><Message>disk on fire</Message></Error>";
-    let res = hyper::Response::builder().status(500).body(Body::from(xml.to_string())).unwrap();
-    let res = crate::storage::log_server_error(&Method::PUT, &hyper::Uri::from_static("/b/k"), res).await;
+    let res = hyper::Response::builder()
+        .status(500)
+        .body(Body::from(xml.to_string()))
+        .unwrap();
+    let res =
+        crate::storage::log_server_error(&Method::PUT, &hyper::Uri::from_static("/b/k"), res).await;
     assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let (_, mut body) = res.into_parts();
     assert_eq!(body.store_all_limited(1024).await.unwrap(), xml.as_bytes());
-    assert_eq!(crate::storage::xml_text(xml, "Message"), Some("disk on fire"));
+    assert_eq!(
+        crate::storage::xml_text(xml, "Message"),
+        Some("disk on fire")
+    );
 }
 
 /// Rebuild `req` with its wire body changed by `f`.
 async fn with_wire_body(req: s3s::HttpRequest, f: impl FnOnce(&mut Vec<u8>)) -> s3s::HttpRequest {
     let (mut parts, mut body) = req.into_parts();
-    let mut wire = body.store_all_limited(64 * 1024 * 1024).await.unwrap().to_vec();
+    let mut wire = body
+        .store_all_limited(64 * 1024 * 1024)
+        .await
+        .unwrap()
+        .to_vec();
     f(&mut wire);
     parts.headers.insert("content-length", wire.len().into());
     Request::from_parts(parts, Body::from(wire))
@@ -433,12 +589,20 @@ async fn tampered_signed_chunk_is_rejected_as_signature_mismatch() {
         "/bucket/tampered",
         &[],
         &[],
-        Wire::SignedTrailer { data: body.clone(), trailer: ("x-amz-checksum-crc32c", crc32c(&body)) },
+        Wire::SignedTrailer {
+            data: body.clone(),
+            trailer: ("x-amz-checksum-crc32c", crc32c(&body)),
+        },
     );
     // Flip one payload byte inside the first chunk (past its header line).
     let req = with_wire_body(req, |w| w[200] ^= 0xFF).await;
     let (status, _, resp) = call(&h, req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{}", String::from_utf8_lossy(&resp));
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
     assert_eq!(s3_code(&resp), "SignatureDoesNotMatch");
     assert_eq!(get(&h, "/bucket/tampered").await.0, StatusCode::NOT_FOUND);
 }
@@ -452,10 +616,17 @@ async fn truncated_chunked_body_is_a_client_error_not_a_500() {
         "/bucket/truncated",
         &[],
         &[],
-        Wire::UnsignedTrailer { data: body.clone(), trailer: ("x-amz-checksum-crc64nvme", crc64nvme(&body)) },
+        Wire::UnsignedTrailer {
+            data: body.clone(),
+            trailer: ("x-amz-checksum-crc64nvme", crc64nvme(&body)),
+        },
     );
     let req = with_wire_body(req, |w| w.truncate(w.len() / 2)).await;
     let (status, _, resp) = call(&h, req).await;
-    assert!(status.is_client_error(), "got {status}: {}", String::from_utf8_lossy(&resp));
+    assert!(
+        status.is_client_error(),
+        "got {status}: {}",
+        String::from_utf8_lossy(&resp)
+    );
     assert_eq!(get(&h, "/bucket/truncated").await.0, StatusCode::NOT_FOUND);
 }
