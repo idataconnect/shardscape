@@ -2,6 +2,7 @@
 name = "shardscape"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
 description = "Self-hosted, multi-site, S3-compatible object store with global content-addressed deduplication"
 license = "Apache-2.0"
 repository = "https://github.com/idataconnect/shardscape"

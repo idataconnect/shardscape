@@ -49,6 +49,8 @@ of sites.
 
 ### Build
 
+Requires Rust 1.96 or newer.
+
 ```sh
 cargo build --release
 sudo install -m 0755 target/release/shardscape /usr/local/bin/shardscape
