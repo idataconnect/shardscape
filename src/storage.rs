@@ -894,6 +894,57 @@ impl StorageBackend {
         }
         Ok(())
     }
+
+    /// One page of a bucket listing, shared by ListObjectsV2 and
+    /// ListObjectVersions. Returns (objects, common_prefixes, is_truncated,
+    /// next_marker).
+    async fn list_page(
+        &self,
+        bucket: &str,
+        start_after: Option<&str>,
+        prefix: Option<&str>,
+        delimiter: Option<&str>,
+        max_keys: usize,
+    ) -> S3Result<(Vec<(String, i64, String)>, Vec<String>, bool, Option<String>)> {
+        match delimiter {
+            // No delimiter: one page straight from the store (fast path).
+            None => {
+                let (objects, is_truncated) = self.objects
+                    .list_objects(bucket, start_after, prefix, max_keys)
+                    .await
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+                let next_token = if is_truncated {
+                    objects.last().map(|(k, _, _)| k.clone())
+                } else {
+                    None
+                };
+                Ok((objects, Vec::new(), is_truncated, next_token))
+            }
+            // With a delimiter, keys sharing a path segment collapse into one
+            // CommonPrefix, so a single store page could over-report truncation.
+            // Scan the prefix range (bounded) and group, then truncate the merged
+            // result to max_keys — CommonPrefixes and Contents both count toward it.
+            Some(delim) => {
+                const SCAN_CAP: usize = 100_000;
+                let mut gathered: Vec<(String, i64, String)> = Vec::new();
+                let mut cursor = start_after.map(|s| s.to_string());
+                loop {
+                    let (page, more) = self.objects
+                        .list_objects(bucket, cursor.as_deref(), prefix, 1000)
+                        .await
+                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+                    let last = page.last().map(|(k, _, _)| k.clone());
+                    gathered.extend(page);
+                    match last {
+                        Some(k) if more && gathered.len() < SCAN_CAP => cursor = Some(k),
+                        _ => break,
+                    }
+                }
+                let (contents, common) = group_by_delimiter(gathered, prefix.unwrap_or(""), delim);
+                Ok(merge_and_truncate(contents, common, max_keys))
+            }
+        }
+    }
 }
 
 /// Collapse keys under `prefix` whose remainder contains `delimiter` into a
@@ -1329,44 +1380,8 @@ impl S3 for StorageBackend {
         let max_keys = input.max_keys.unwrap_or(1000).max(1) as usize;
         let delimiter = input.delimiter.as_deref();
 
-        let (kept, common_prefixes, is_truncated, next_token) = match delimiter {
-            // No delimiter: one page straight from the store (fast path).
-            None => {
-                let (objects, is_truncated) = self.objects
-                    .list_objects(&bucket, start_after, prefix, max_keys)
-                    .await
-                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                let next_token = if is_truncated {
-                    objects.last().map(|(k, _, _)| k.clone())
-                } else {
-                    None
-                };
-                (objects, Vec::new(), is_truncated, next_token)
-            }
-            // With a delimiter, keys sharing a path segment collapse into one
-            // CommonPrefix, so a single store page could over-report truncation.
-            // Scan the prefix range (bounded) and group, then truncate the merged
-            // result to max_keys — CommonPrefixes and Contents both count toward it.
-            Some(delim) => {
-                const SCAN_CAP: usize = 100_000;
-                let mut gathered: Vec<(String, i64, String)> = Vec::new();
-                let mut cursor = start_after.map(|s| s.to_string());
-                loop {
-                    let (page, more) = self.objects
-                        .list_objects(&bucket, cursor.as_deref(), prefix, 1000)
-                        .await
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    let last = page.last().map(|(k, _, _)| k.clone());
-                    gathered.extend(page);
-                    match last {
-                        Some(k) if more && gathered.len() < SCAN_CAP => cursor = Some(k),
-                        _ => break,
-                    }
-                }
-                let (contents, common) = group_by_delimiter(gathered, prefix.unwrap_or(""), delim);
-                merge_and_truncate(contents, common, max_keys)
-            }
-        };
+        let (kept, common_prefixes, is_truncated, next_token) =
+            self.list_page(&bucket, start_after, prefix, delimiter, max_keys).await?;
 
         let contents: Vec<Object> = kept
             .into_iter()
@@ -1409,6 +1424,57 @@ impl S3 for StorageBackend {
     ) -> S3Result<S3Response<HeadBucketOutput>> {
         self.authorize(&req, "s3:ListBucket", Some(&req.input.bucket), None).await?;
         Ok(S3Response::new(HeadBucketOutput::default()))
+    }
+
+    /// Versioning is not implemented: every object has exactly one version,
+    /// reported as the latest with the "null" version id, as S3 does for
+    /// buckets that have never had versioning enabled.
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        self.authorize(&req, "s3:ListBucketVersions", Some(&req.input.bucket), None).await?;
+        let input = req.input;
+        let bucket = input.bucket;
+        let prefix = input.prefix.as_deref();
+        let key_marker = input.key_marker.as_deref();
+        let max_keys = input.max_keys.unwrap_or(1000).max(1) as usize;
+        let delimiter = input.delimiter.as_deref();
+
+        let (kept, common_prefixes, is_truncated, next_marker) =
+            self.list_page(&bucket, key_marker, prefix, delimiter, max_keys).await?;
+
+        let versions: Vec<ObjectVersion> = kept
+            .into_iter()
+            .map(|(key, size, etag)| ObjectVersion {
+                key: Some(key),
+                size: Some(size),
+                e_tag: Some(format!("\"{}\"", etag)),
+                last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
+                is_latest: Some(true),
+                version_id: Some("null".to_string()),
+                ..Default::default()
+            })
+            .collect();
+        let common_prefixes: Vec<CommonPrefix> = common_prefixes
+            .into_iter()
+            .map(|p| CommonPrefix { prefix: Some(p) })
+            .collect();
+
+        let output = ListObjectVersionsOutput {
+            name: Some(bucket),
+            prefix: prefix.map(|p| p.to_string()),
+            delimiter: delimiter.map(|d| d.to_string()),
+            key_marker: key_marker.map(|k| k.to_string()),
+            versions: Some(versions),
+            common_prefixes: if common_prefixes.is_empty() { None } else { Some(common_prefixes) },
+            is_truncated: Some(is_truncated),
+            next_key_marker: next_marker,
+            next_version_id_marker: if is_truncated { Some("null".to_string()) } else { None },
+            max_keys: Some(max_keys as i32),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
     }
 
     async fn list_objects(
@@ -2153,7 +2219,9 @@ mod tests {
             Ok(vec![])
         }
         async fn list_objects(&self, _b: &str, _s: Option<&str>, _p: Option<&str>, _ps: usize) -> Result<(Vec<(String, i64, String)>, bool), anyhow::Error> {
-            Ok((vec![], false))
+            // Surface the "existing" object (if any) under key "k".
+            let existing = self.existing.lock().unwrap().clone();
+            Ok((existing.into_iter().map(|(_, size, etag)| ("k".to_string(), size, etag)).collect(), false))
         }
         async fn delete_object(&self, b: &str, k: &str) -> Result<(), anyhow::Error> {
             self.delete_calls.lock().unwrap().push((b.to_string(), k.to_string()));
@@ -2698,6 +2766,43 @@ mod tests {
         let res = backend.list_objects_v2(S3Request::new(input)).await.unwrap();
         assert_eq!(res.output.key_count, Some(0));
         assert_eq!(res.output.is_truncated, Some(false));
+    }
+
+    // ── list_object_versions ──────────────────────────────────────────────────
+
+    fn versions_input(bucket: &str) -> ListObjectVersionsInput {
+        ListObjectVersionsInput {
+            bucket: bucket.to_string(),
+            delimiter: None, encoding_type: None, expected_bucket_owner: None,
+            key_marker: None, max_keys: None, optional_object_attributes: vec![],
+            prefix: None, request_payer: None, version_id_marker: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_empty_bucket() {
+        let backend = make_backend(MockObjectStore::new(), MockBlockStore::new(), 64);
+        let res = backend.list_object_versions(S3Request::new(versions_input("b"))).await.unwrap();
+        assert_eq!(res.output.versions.as_deref().map(|v| v.len()), Some(0));
+        assert_eq!(res.output.is_truncated, Some(false));
+        assert_eq!(res.output.name.as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_reports_single_null_version_per_object() {
+        let objects = MockObjectStore::with_existing(vec![vec![0u8; 32]], 42, "vetag");
+        let backend = make_backend(objects, MockBlockStore::new(), 64);
+        let res = backend.list_object_versions(S3Request::new(versions_input("b"))).await.unwrap();
+        let versions = res.output.versions.unwrap();
+        assert_eq!(versions.len(), 1);
+        let v = &versions[0];
+        assert_eq!(v.key.as_deref(), Some("k"));
+        assert_eq!(v.size, Some(42));
+        assert_eq!(v.e_tag.as_deref(), Some("\"vetag\""));
+        assert_eq!(v.version_id.as_deref(), Some("null"));
+        assert_eq!(v.is_latest, Some(true));
+        assert_eq!(res.output.delete_markers, None);
+        assert_eq!(res.output.next_key_marker, None);
     }
 
     // ── complete_multipart_upload ─────────────────────────────────────────────
