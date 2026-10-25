@@ -29,6 +29,14 @@ of sites.
 ## Features
 
 - **S3-compatible API** — works with any S3 client (aws-cli, rclone, boto3, etc.)
+- **Upload integrity checks** — accepts the aws-chunked uploads with trailing
+  checksums that current aws-cli and AWS SDKs send by default
+  (`STREAMING-UNSIGNED-PAYLOAD-TRAILER` and
+  `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`), and verifies every
+  `x-amz-checksum-*` value (CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256, SHA-512,
+  MD5, XXHASH64/3/128, as header or trailer) and `Content-MD5` against the bytes
+  received, rejecting a mismatch with `BadDigest`. No client-side
+  `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` workaround is needed
 - **Content-addressed deduplication** — identical data is stored once, globally
 - **Async replication** — sites converge without consensus; no quorum needed
 - **Offline-tolerant** — a site can be offline for weeks and rejoin cleanly
