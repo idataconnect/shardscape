@@ -576,22 +576,22 @@ impl StorageBackend {
             // SWEEP: confirmed orphan past grace (or forced). Delete the local
             // physical copy and drop our location entry; the block row vanishes
             // once the last site has done the same.
-            if let Some(fid_bytes) = db.get_local_block_fid(hash).await? {
-                if db.delete_local_block(hash).await? {
-                    let _ = self.blocks.delete_block(hash, &fid_bytes).await;
-                    info!(
-                        "GC{}: deleted local block {}",
-                        if force { " (forced)" } else { "" },
-                        hex::encode(hash),
-                    );
-                }
+            if let Some(fid_bytes) = db.get_local_block_fid(hash).await?
+                && db.delete_local_block(hash).await?
+            {
+                let _ = self.blocks.delete_block(hash, &fid_bytes).await;
+                info!(
+                    "GC{}: deleted local block {}",
+                    if force { " (forced)" } else { "" },
+                    hex::encode(hash),
+                );
             }
             let _ = db.remove_pending_deletion(hash).await;
         }
 
         // Drop pending entries for blocks we no longer hold (e.g. already reaped
         // on a prior cycle) so the table doesn't accumulate stale rows.
-        for (hash, _) in &pending {
+        for hash in pending.keys() {
             if !local.iter().any(|h| h == hash) {
                 let _ = db.remove_pending_deletion(hash).await;
             }
@@ -1144,12 +1144,7 @@ impl StorageBackend {
         prefix: Option<&str>,
         delimiter: Option<&str>,
         max_keys: usize,
-    ) -> S3Result<(
-        Vec<(String, i64, String)>,
-        Vec<String>,
-        bool,
-        Option<String>,
-    )> {
+    ) -> S3Result<ListingPage> {
         match delimiter {
             // No delimiter: one page straight from the store (fast path).
             None => {
@@ -1296,6 +1291,15 @@ fn slice_block_bytes(data: Bytes, skip: u64, take: Option<u64>) -> Bytes {
     }
 }
 
+/// One page of a listing: (contents as (key, size, etag), common prefixes,
+/// is_truncated, next continuation token / marker).
+type ListingPage = (
+    Vec<(String, i64, String)>,
+    Vec<String>,
+    bool,
+    Option<String>,
+);
+
 /// Merge grouped contents and common prefixes into a single key-ordered result
 /// truncated to `max_keys` (both counting toward the cap, per S3). Returns
 /// (kept_contents, kept_common_prefixes, is_truncated, next_continuation_token).
@@ -1303,12 +1307,7 @@ fn merge_and_truncate(
     contents: Vec<(String, i64, String)>,
     common: Vec<String>,
     max_keys: usize,
-) -> (
-    Vec<(String, i64, String)>,
-    Vec<String>,
-    bool,
-    Option<String>,
-) {
+) -> ListingPage {
     enum Item {
         Obj((String, i64, String)),
         Prefix(String),

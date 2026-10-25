@@ -1078,7 +1078,7 @@ impl Store {
             } => {
                 let decoded: Vec<Vec<u8>> = blocks
                     .iter()
-                    .map(|h| hex::decode(h))
+                    .map(hex::decode)
                     .collect::<std::result::Result<_, _>>()?;
                 let encoded = Self::encode_blocks(&decoded);
                 let shard_id = crate::hashing::compute_shard_id(key);

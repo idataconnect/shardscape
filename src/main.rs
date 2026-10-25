@@ -1124,44 +1124,18 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
         }
         out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::*;
-
-    #[test]
-    fn render_k8s_uses_site_and_ports_from_config() {
-        let mut config = config::Config::default();
-        config.storage.local_location_id = "office".to_string();
-        config.server.s3_bind_addr = "0.0.0.0:9000".to_string();
-        config.server.internal_bind_addr = "0.0.0.0:9001".to_string();
-        let y = render_k8s_manifests(&config);
-        assert!(y.contains("shardscape-office"));
-        assert!(y.contains("name: shardscape")); // namespace
-        assert!(y.contains("containerPort: 9000"));
-        assert!(y.contains("containerPort: 9001"));
-        assert!(y.contains(r#"args: ["serve", "--config", "/data/config.toml"]"#));
-    }
-
-    #[test]
-    fn random_hex_is_right_length_and_varies() {
-        let a = random_hex(32);
-        let b = random_hex(32);
-        assert_eq!(a.len(), 64); // 32 bytes → 64 hex chars
-        assert_ne!(a, b, "two draws should differ");
-    }
 }
 
 async fn bootstrap_admin_user(db: &db::Db) -> anyhow::Result<()> {
@@ -1520,4 +1494,31 @@ spec:
     - {{ name: internal, port: {internal_port}, targetPort: internal }}
 "#
     )
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn render_k8s_uses_site_and_ports_from_config() {
+        let mut config = config::Config::default();
+        config.storage.local_location_id = "office".to_string();
+        config.server.s3_bind_addr = "0.0.0.0:9000".to_string();
+        config.server.internal_bind_addr = "0.0.0.0:9001".to_string();
+        let y = render_k8s_manifests(&config);
+        assert!(y.contains("shardscape-office"));
+        assert!(y.contains("name: shardscape")); // namespace
+        assert!(y.contains("containerPort: 9000"));
+        assert!(y.contains("containerPort: 9001"));
+        assert!(y.contains(r#"args: ["serve", "--config", "/data/config.toml"]"#));
+    }
+
+    #[test]
+    fn random_hex_is_right_length_and_varies() {
+        let a = random_hex(32);
+        let b = random_hex(32);
+        assert_eq!(a.len(), 64); // 32 bytes → 64 hex chars
+        assert_ne!(a, b, "two draws should differ");
+    }
 }
