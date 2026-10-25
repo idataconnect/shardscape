@@ -703,6 +703,34 @@ impl S3Auth for ShardscapeAuth {
     }
 }
 
+/// Log every 5xx the S3 listener answers with, with the S3 error code and
+/// message from the response body. A 500 means the store failed, not the
+/// client, so the operator needs to see why — and the client only ever sees
+/// the XML. 4xx responses are the client's business and are not logged.
+pub async fn log_server_error(method: &hyper::Method, uri: &hyper::Uri, res: s3s::HttpResponse) -> s3s::HttpResponse {
+    if !res.status().is_server_error() {
+        return res;
+    }
+    let (parts, mut body) = res.into_parts();
+    // Error bodies are a few hundred bytes of XML; the cap only guards against
+    // buffering something unexpected.
+    let bytes = body.store_all_limited(64 * 1024).await.unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes);
+    let code = xml_text(&text, "Code").unwrap_or("-");
+    let message = xml_text(&text, "Message").unwrap_or("-");
+    tracing::warn!(status = parts.status.as_u16(), %method, path = uri.path(), code, message, "S3 request failed");
+    hyper::Response::from_parts(parts, s3s::Body::from(bytes))
+}
+
+/// The text of the first `<tag>…</tag>` in `xml` (no entity decoding; this is
+/// only for log lines).
+pub(crate) fn xml_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&format!("</{tag}>"))? + start;
+    Some(&xml[start..end])
+}
+
 /// Cap on establishing a peer connection: TCP connect + Noise handshake + HTTP/1
 /// handshake. Short because these are LAN/WAN control-plane round trips.
 const PEER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -871,6 +899,65 @@ impl StorageBackend {
             db: Some(db),
             disk_guard,
         }
+    }
+
+    /// Stream an upload body (PutObject / UploadPart) into content-defined
+    /// blocks, computing the MD5 ETag and verifying any client-supplied
+    /// checksum (header or aws-chunked trailer) once the body is fully read.
+    ///
+    /// Blocks are written as the body streams, so a body rejected at the end
+    /// (bad checksum, truncated stream) leaves its blocks unreferenced; the
+    /// orphan sweep reclaims them exactly as for any aborted upload.
+    async fn ingest_body(
+        &self,
+        mut body: StreamingBlob,
+        ref_id: &str,
+        request_headers: &hyper::HeaderMap,
+        expected: crate::integrity::Expected,
+        trailers: Option<&s3s::TrailingHeaders>,
+    ) -> S3Result<Ingested> {
+        let mut verifier = crate::integrity::BodyVerifier::new(request_headers, expected);
+        let mut block_hashes: Vec<Vec<u8>> = Vec::new();
+        let mut total_size: i64 = 0;
+
+        // Use a reasonable buffer capacity based on config
+        let initial_capacity = match self.config.storage.chunking {
+            crate::config::ChunkingConfig::Fixed { max_block_size } => max_block_size,
+            crate::config::ChunkingConfig::Cdc { max_block_size, .. } => max_block_size,
+        };
+
+        let mut current_chunk = BytesMut::with_capacity(initial_capacity);
+        let mut md5 = Md5::new();
+
+        while let Some(res) = body.next().await {
+            let chunk = res.map_err(body_read_error)?;
+            md5.update(&chunk);
+            verifier.update(&chunk);
+            current_chunk.extend_from_slice(&chunk);
+
+            for block_data in self.chunker.process(&mut current_chunk) {
+                let len = block_data.len() as i64;
+                total_size += len;
+                let hash = self.blocks.store_block(block_data, len, ref_id).await
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("storing block: {e}")))?;
+                block_hashes.push(hash);
+            }
+        }
+
+        if let Some(block_data) = self.chunker.finalize(&mut current_chunk) {
+            let len = block_data.len() as i64;
+            total_size += len;
+            let hash = self.blocks.store_block(block_data, len, ref_id).await
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("storing block: {e}")))?;
+            block_hashes.push(hash);
+        }
+
+        let md5 = md5.finalize();
+        // aws-chunked trailers are only available once the body is fully read.
+        let trailers = trailers.and_then(|t| t.take());
+        let checksum = verifier.finish(trailers.as_ref(), &md5)?;
+
+        Ok(Ingested { block_hashes, total_size, etag: hex::encode(md5), checksum })
     }
 
     /// Returns a 503 if the disk guard has tripped, so local S3 writes are
@@ -1076,6 +1163,30 @@ fn merge_and_truncate(
     (kept_contents, kept_common, is_truncated, next_token)
 }
 
+/// The result of streaming one upload body into the block store.
+struct Ingested {
+    block_hashes: Vec<Vec<u8>>,
+    total_size: i64,
+    /// Hex MD5 of the body (the S3 ETag of a single-part object or a part).
+    etag: String,
+    /// The checksums computed while verifying the body, echoed in the response.
+    checksum: Checksum,
+}
+
+/// Map an error from reading a request body to an S3 error. Malformed or
+/// truncated aws-chunked bodies and bad chunk signatures are the client's
+/// fault and get the 4xx S3 specifies; anything else (e.g. the connection
+/// dropping mid-upload) stays a 500 with the reason attached.
+fn body_read_error(e: s3s::StdError) -> S3Error {
+    if let Some(chunked) = e.downcast_ref::<s3s::stream::aws_chunked_stream::AwsChunkedStreamError>() {
+        return S3Error::with_message(chunked.to_s3_error_code(), format!("reading request body: {chunked}"));
+    }
+    if let Some(limit) = e.downcast_ref::<s3s::BodySizeLimitExceeded>() {
+        return S3Error::with_message(S3ErrorCode::EntityTooLarge, limit.to_string());
+    }
+    S3Error::with_message(S3ErrorCode::InternalError, format!("reading request body: {e}"))
+}
+
 #[async_trait]
 impl S3 for StorageBackend {
     async fn put_object(
@@ -1089,49 +1200,31 @@ impl S3 for StorageBackend {
         let key = input.key;
         let shard_id = compute_shard_id(&key);
 
-        let mut body = input.body.ok_or_else(|| {
+        let expected = crate::integrity::Expected {
+            headers: Checksum {
+                checksum_crc32: input.checksum_crc32,
+                checksum_crc32c: input.checksum_crc32c,
+                checksum_crc64nvme: input.checksum_crc64nvme,
+                checksum_md5: input.checksum_md5,
+                checksum_sha1: input.checksum_sha1,
+                checksum_sha256: input.checksum_sha256,
+                checksum_sha512: input.checksum_sha512,
+                checksum_xxhash128: input.checksum_xxhash128,
+                checksum_xxhash3: input.checksum_xxhash3,
+                checksum_xxhash64: input.checksum_xxhash64,
+                ..Default::default()
+            },
+            algorithm: input.checksum_algorithm,
+            content_md5: input.content_md5,
+        };
+        let body = input.body.ok_or_else(|| {
             S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing body")
         })?;
+        let ref_id = format!("obj:{}:{}", bucket, key);
+        let Ingested { block_hashes, total_size, etag, checksum } = self
+            .ingest_body(body, &ref_id, &req.headers, expected, req.trailing_headers.as_ref())
+            .await?;
 
-        let mut block_hashes: Vec<Vec<u8>> = Vec::new();
-        let mut total_size: i64 = 0;
-
-        // Use a reasonable buffer capacity based on config
-        let initial_capacity = match self.config.storage.chunking {
-            crate::config::ChunkingConfig::Fixed { max_block_size } => max_block_size,
-            crate::config::ChunkingConfig::Cdc { max_block_size, .. } => max_block_size,
-        };
-
-        let mut current_chunk = BytesMut::with_capacity(initial_capacity);
-        let mut md5 = Md5::new();
-
-        while let Some(res) = body.next().await {
-            let chunk = res.map_err(|e: Box<dyn std::error::Error + Send + Sync + 'static>| {
-                S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
-            })?;
-            md5.update(&chunk);
-            current_chunk.extend_from_slice(&chunk);
-
-            for block_data in self.chunker.process(&mut current_chunk) {
-                let len = block_data.len() as i64;
-                total_size += len;
-                let ref_id = format!("obj:{}:{}", bucket, key);
-                let hash = self.blocks.store_block(block_data, len, &ref_id).await
-                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                block_hashes.push(hash);
-            }
-        }
-
-        if let Some(block_data) = self.chunker.finalize(&mut current_chunk) {
-            let len = block_data.len() as i64;
-            total_size += len;
-            let ref_id = format!("obj:{}:{}", bucket, key);
-            let hash = self.blocks.store_block(block_data, len, &ref_id).await
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-            block_hashes.push(hash);
-        }
-
-        let etag = hex::encode(md5.finalize());
         info!(bucket, key, shard_id, total_size, etag, "PutObject");
 
         // Handle overwrite ref-counting
@@ -1146,7 +1239,17 @@ impl S3 for StorageBackend {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let output = PutObjectOutput{
-            e_tag: Some(format!("\"{}\"", etag)),
+            e_tag: Some(ETag::Strong(etag.to_string())),
+            checksum_crc32: checksum.checksum_crc32,
+            checksum_crc32c: checksum.checksum_crc32c,
+            checksum_crc64nvme: checksum.checksum_crc64nvme,
+            checksum_md5: checksum.checksum_md5,
+            checksum_sha1: checksum.checksum_sha1,
+            checksum_sha256: checksum.checksum_sha256,
+            checksum_sha512: checksum.checksum_sha512,
+            checksum_xxhash128: checksum.checksum_xxhash128,
+            checksum_xxhash3: checksum.checksum_xxhash3,
+            checksum_xxhash64: checksum.checksum_xxhash64,
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -1234,7 +1337,7 @@ impl S3 for StorageBackend {
             content_length: Some(content_length),
             content_range,
             accept_ranges: Some("bytes".to_string()),
-            e_tag: Some(format!("\"{}\"", etag)),
+            e_tag: Some(ETag::Strong(etag.to_string())),
             last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
             ..Default::default()
         };
@@ -1359,7 +1462,7 @@ impl S3 for StorageBackend {
 
         let output = HeadObjectOutput{
             content_length: Some(size),
-            e_tag: Some(format!("\"{}\"", etag)),
+            e_tag: Some(ETag::Strong(etag.to_string())),
             last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
             ..Default::default()
         };
@@ -1389,7 +1492,7 @@ impl S3 for StorageBackend {
                 Object{
                     key: Some(key),
                     size: Some(size),
-                    e_tag: Some(format!("\"{}\"", etag)),
+                    e_tag: Some(ETag::Strong(etag.to_string())),
                     last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
                     ..Default::default()
                 }
@@ -1449,7 +1552,7 @@ impl S3 for StorageBackend {
             .map(|(key, size, etag)| ObjectVersion {
                 key: Some(key),
                 size: Some(size),
-                e_tag: Some(format!("\"{}\"", etag)),
+                e_tag: Some(ETag::Strong(etag.to_string())),
                 last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
                 is_latest: Some(true),
                 version_id: Some("null".to_string()),
@@ -1528,7 +1631,7 @@ impl S3 for StorageBackend {
             .map(|(key, size, etag)| Object {
                 key: Some(key),
                 size: Some(size),
-                e_tag: Some(format!("\"{}\"", etag)),
+                e_tag: Some(ETag::Strong(etag.to_string())),
                 last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
                 ..Default::default()
             })
@@ -1562,8 +1665,8 @@ impl S3 for StorageBackend {
         let input = req.input;
         let (src_bucket, src_key) = match &input.copy_source {
             CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
-            CopySource::AccessPoint { .. } => {
-                return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "AccessPoint copy source not supported"));
+            CopySource::AccessPoint { .. } | CopySource::Outpost { .. } => {
+                return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "AccessPoint/Outpost copy source not supported"));
             }
         };
 
@@ -1591,7 +1694,7 @@ impl S3 for StorageBackend {
 
         let output = CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
-                e_tag: Some(format!("\"{}\"", etag)),
+                e_tag: Some(ETag::Strong(etag.to_string())),
                 last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
                 ..Default::default()
             }),
@@ -1616,9 +1719,7 @@ impl S3 for StorageBackend {
         let parts = self.objects.list_parts(&input.bucket, upload_id).await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let part_number_marker = input.part_number_marker.as_deref()
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(0);
+        let part_number_marker = input.part_number_marker.unwrap_or(0);
         let max_parts = input.max_parts.unwrap_or(1000).max(1) as usize;
 
         let filtered: Vec<_> = parts.into_iter()
@@ -1631,14 +1732,14 @@ impl S3 for StorageBackend {
             .map(|(num, _blocks, size, etag)| Part {
                 part_number: Some(num),
                 size: Some(size),
-                e_tag: Some(format!("\"{}\"", etag)),
+                e_tag: Some(ETag::Strong(etag.to_string())),
                 last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
                 ..Default::default()
             })
             .collect();
 
         let next_marker = if is_truncated {
-            result_parts.last().and_then(|p| p.part_number).map(|n| n.to_string())
+            result_parts.last().and_then(|p| p.part_number)
         } else {
             None
         };
@@ -1720,8 +1821,8 @@ impl S3 for StorageBackend {
 
         let (src_bucket, src_key) = match &input.copy_source {
             CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
-            CopySource::AccessPoint { .. } => {
-                return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "AccessPoint copy source not supported"));
+            CopySource::AccessPoint { .. } | CopySource::Outpost { .. } => {
+                return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "AccessPoint/Outpost copy source not supported"));
             }
         };
 
@@ -1787,7 +1888,7 @@ impl S3 for StorageBackend {
 
         let output = UploadPartCopyOutput {
             copy_part_result: Some(CopyPartResult {
-                e_tag: Some(format!("\"{}\"", etag)),
+                e_tag: Some(ETag::Strong(etag.to_string())),
                 last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
                 ..Default::default()
             }),
@@ -1831,53 +1932,46 @@ impl S3 for StorageBackend {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchUpload, "Upload not found"))?;
 
-        let mut body = input.body.ok_or_else(|| {
+        let expected = crate::integrity::Expected {
+            headers: Checksum {
+                checksum_crc32: input.checksum_crc32,
+                checksum_crc32c: input.checksum_crc32c,
+                checksum_crc64nvme: input.checksum_crc64nvme,
+                checksum_md5: input.checksum_md5,
+                checksum_sha1: input.checksum_sha1,
+                checksum_sha256: input.checksum_sha256,
+                checksum_sha512: input.checksum_sha512,
+                checksum_xxhash128: input.checksum_xxhash128,
+                checksum_xxhash3: input.checksum_xxhash3,
+                checksum_xxhash64: input.checksum_xxhash64,
+                ..Default::default()
+            },
+            algorithm: input.checksum_algorithm,
+            content_md5: input.content_md5,
+        };
+        let body = input.body.ok_or_else(|| {
             S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing body")
         })?;
+        let ref_id = format!("upload:{}:{}", input.bucket, input.upload_id);
+        let Ingested { block_hashes, total_size, etag, checksum } = self
+            .ingest_body(body, &ref_id, &req.headers, expected, req.trailing_headers.as_ref())
+            .await?;
 
-        let mut block_hashes: Vec<Vec<u8>> = Vec::new();
-        let mut total_size: i64 = 0;
-
-        let initial_capacity = match self.config.storage.chunking {
-            crate::config::ChunkingConfig::Fixed { max_block_size } => max_block_size,
-            crate::config::ChunkingConfig::Cdc { max_block_size, .. } => max_block_size,
-        };
-
-        let mut current_chunk = BytesMut::with_capacity(initial_capacity);
-        let mut md5 = Md5::new();
-
-        while let Some(res) = body.next().await {
-            let chunk = res.map_err(|e: Box<dyn std::error::Error + Send + Sync + 'static>| {
-                S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
-            })?;
-            md5.update(&chunk);
-            current_chunk.extend_from_slice(&chunk);
-
-            for block_data in self.chunker.process(&mut current_chunk) {
-                let len = block_data.len() as i64;
-                total_size += len;
-                let ref_id = format!("upload:{}:{}", input.bucket, input.upload_id);
-                let hash = self.blocks.store_block(block_data, len, &ref_id).await
-                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                block_hashes.push(hash);
-            }
-        }
-
-        if let Some(block_data) = self.chunker.finalize(&mut current_chunk) {
-            let len = block_data.len() as i64;
-            total_size += len;
-            let ref_id = format!("upload:{}:{}", input.bucket, input.upload_id);
-            let hash = self.blocks.store_block(block_data, len, &ref_id).await
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-            block_hashes.push(hash);
-        }
-
-        let etag = hex::encode(md5.finalize());
         self.objects.insert_part(&input.bucket, upload_id, input.part_number, block_hashes, total_size, &etag).await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let output = UploadPartOutput{
-            e_tag: Some(format!("\"{}\"", etag)),
+            e_tag: Some(ETag::Strong(etag.to_string())),
+            checksum_crc32: checksum.checksum_crc32,
+            checksum_crc32c: checksum.checksum_crc32c,
+            checksum_crc64nvme: checksum.checksum_crc64nvme,
+            checksum_md5: checksum.checksum_md5,
+            checksum_sha1: checksum.checksum_sha1,
+            checksum_sha256: checksum.checksum_sha256,
+            checksum_sha512: checksum.checksum_sha512,
+            checksum_xxhash128: checksum.checksum_xxhash128,
+            checksum_xxhash3: checksum.checksum_xxhash3,
+            checksum_xxhash64: checksum.checksum_xxhash64,
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -1951,7 +2045,7 @@ impl S3 for StorageBackend {
         let output = CompleteMultipartUploadOutput{
             bucket: Some(input.bucket),
             key: Some(key),
-            e_tag: Some(format!("\"{}\"", final_etag)),
+            e_tag: Some(ETag::Strong(final_etag.to_string())),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -2447,27 +2541,29 @@ mod tests {
         assert!(store.get_local_block_fid(&gh(4)).await.unwrap().is_some());
     }
 
-    fn put_input(bucket: &str, key: &str, data: Vec<u8>) -> PutObjectInput {
-        PutObjectInput {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            body: Some(StreamingBlob::from(Body::from(data))),
-            acl: None, cache_control: None, content_disposition: None,
-            content_encoding: None, content_language: None, content_length: None,
-            content_md5: None, content_type: None, checksum_algorithm: None,
-            checksum_crc32: None, checksum_crc32c: None, checksum_sha1: None,
-            checksum_sha256: None, expires: None, grant_full_control: None,
-            grant_read: None, grant_read_acp: None, grant_write_acp: None,
-            metadata: None, server_side_encryption: None, storage_class: None,
-            website_redirect_location: None, sse_customer_algorithm: None,
-            sse_customer_key: None, sse_customer_key_md5: None,
-            ssekms_key_id: None, ssekms_encryption_context: None,
-            bucket_key_enabled: None, request_payer: None, tagging: None,
-            object_lock_mode: None, object_lock_retain_until_date: None,
-            object_lock_legal_hold_status: None, expected_bucket_owner: None,
-            checksum_crc64nvme: None, if_match: None, if_none_match: None,
-            write_offset_bytes: None,
+    /// An anonymous S3Request around `input`, as s3s would hand it to the
+    /// backend for a request without aws-chunked trailers.
+    fn s3req<T>(input: T) -> S3Request<T> {
+        S3Request {
+            input,
+            method: hyper::Method::PUT,
+            uri: hyper::Uri::from_static("/"),
+            headers: hyper::HeaderMap::new(),
+            extensions: Default::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
         }
+    }
+
+    fn put_input(bucket: &str, key: &str, data: Vec<u8>) -> PutObjectInput {
+        PutObjectInput::builder()
+            .bucket(bucket.to_string())
+            .key(key.to_string())
+            .body(Some(StreamingBlob::from(Body::from(data))))
+            .build()
+            .unwrap()
     }
 
     // ── disk guard ────────────────────────────────────────────────────────────
@@ -2480,7 +2576,7 @@ mod tests {
         backend.disk_guard = crate::disk::DiskGuard::tripped();
 
         let err = match backend
-            .put_object(S3Request::new(put_input("b", "k", vec![0x41u8; 25])))
+            .put_object(s3req(put_input("b", "k", vec![0x41u8; 25])))
             .await
         {
             Ok(_) => panic!("write should be refused under disk pressure"),
@@ -2500,7 +2596,7 @@ mod tests {
         backend.disk_guard = crate::disk::DiskGuard::over_quota();
 
         let err = match backend
-            .put_object(S3Request::new(put_input("b", "k", vec![0x41u8; 25])))
+            .put_object(s3req(put_input("b", "k", vec![0x41u8; 25])))
             .await
         {
             Ok(_) => panic!("write should be refused when over quota"),
@@ -2518,7 +2614,7 @@ mod tests {
         let objects = MockObjectStore::new();
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
-        backend.put_object(S3Request::new(put_input("b", "k", vec![1, 2, 3]))).await.unwrap();
+        backend.put_object(s3req(put_input("b", "k", vec![1, 2, 3]))).await.unwrap();
         assert!(objects.inserted.lock().unwrap().is_some());
     }
 
@@ -2531,7 +2627,7 @@ mod tests {
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
 
         let data = vec![0x41u8; 25]; // 'A' * 25
-        let res = backend.put_object(S3Request::new(put_input("b", "k", data))).await.unwrap();
+        let res = backend.put_object(s3req(put_input("b", "k", data))).await.unwrap();
 
         assert_eq!(*blocks.stored_count.lock().unwrap(), 3); // 10 + 10 + 5
         let inserted = objects.inserted.lock().unwrap();
@@ -2540,7 +2636,7 @@ mod tests {
         assert_eq!(key, "k");
         assert_eq!(*size, 25);
         assert_eq!(etag, "1995da96cd16a48cebcbc08424f6f945");
-        assert_eq!(res.output.e_tag.unwrap(), "\"1995da96cd16a48cebcbc08424f6f945\"");
+        assert_eq!(res.output.e_tag.unwrap().into_value(), "1995da96cd16a48cebcbc08424f6f945");
     }
 
     #[tokio::test]
@@ -2549,7 +2645,7 @@ mod tests {
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
 
-        let res = backend.put_object(S3Request::new(put_input("b", "empty", vec![]))).await.unwrap();
+        let res = backend.put_object(s3req(put_input("b", "empty", vec![]))).await.unwrap();
 
         // No blocks to store.
         assert_eq!(*blocks.stored_count.lock().unwrap(), 0);
@@ -2557,7 +2653,7 @@ mod tests {
         let (_, _, size, _) = inserted.as_ref().unwrap();
         assert_eq!(*size, 0);
         // MD5 of empty string
-        assert_eq!(res.output.e_tag.unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+        assert_eq!(res.output.e_tag.unwrap().into_value(), "d41d8cd98f00b204e9800998ecf8427e");
     }
 
     #[tokio::test]
@@ -2566,14 +2662,14 @@ mod tests {
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
 
-        let res = backend.put_object(S3Request::new(put_input("b", "one", vec![0x61]))).await.unwrap();
+        let res = backend.put_object(s3req(put_input("b", "one", vec![0x61]))).await.unwrap();
 
         assert_eq!(*blocks.stored_count.lock().unwrap(), 1);
         let inserted = objects.inserted.lock().unwrap();
         let (_, _, size, _) = inserted.as_ref().unwrap();
         assert_eq!(*size, 1);
         // MD5 of a single byte 0x61 ('a') = 0cc175b9c0f1b6a831c399e269772661
-        assert_eq!(res.output.e_tag.unwrap(), "\"0cc175b9c0f1b6a831c399e269772661\"");
+        assert_eq!(res.output.e_tag.unwrap().into_value(), "0cc175b9c0f1b6a831c399e269772661");
     }
 
     #[tokio::test]
@@ -2583,7 +2679,7 @@ mod tests {
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
 
-        backend.put_object(S3Request::new(put_input("b", "k", vec![0xBBu8; 20]))).await.unwrap();
+        backend.put_object(s3req(put_input("b", "k", vec![0xBBu8; 20]))).await.unwrap();
         assert_eq!(*blocks.stored_count.lock().unwrap(), 2);
     }
 
@@ -2595,7 +2691,7 @@ mod tests {
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 10);
 
-        backend.put_object(S3Request::new(put_input("b", "k", vec![0x42u8; 5]))).await.unwrap();
+        backend.put_object(s3req(put_input("b", "k", vec![0x42u8; 5]))).await.unwrap();
 
         // remove_reference must have been called with the old ref_id.
         let removed = blocks.removed_refs.lock().unwrap();
@@ -2608,9 +2704,11 @@ mod tests {
     #[tokio::test]
     async fn put_object_etag_is_quoted_in_response() {
         let backend = make_backend(MockObjectStore::new(), MockBlockStore::new(), 64);
-        let res = backend.put_object(S3Request::new(put_input("b", "k", vec![1, 2, 3]))).await.unwrap();
+        let res = backend.put_object(s3req(put_input("b", "k", vec![1, 2, 3]))).await.unwrap();
+        // A strong ETag, which s3s serializes quoted on the wire (the HTTP-level
+        // test `service_put_get_round_trip_etag_quoted` checks the header).
         let etag = res.output.e_tag.unwrap();
-        assert!(etag.starts_with('"') && etag.ends_with('"'), "ETag must be quoted: {etag}");
+        assert!(matches!(etag, ETag::Strong(ref v) if !v.contains('"')), "{etag:?}");
     }
 
     // ── get_object ────────────────────────────────────────────────────────────
@@ -2636,15 +2734,15 @@ mod tests {
         let blocks = MockBlockStore::with_data(Bytes::from(vec![0xCCu8; 42]));
         let backend = make_backend(objects, blocks, 64);
 
-        let res = backend.get_object(S3Request::new(get_input("b", "k"))).await.unwrap();
+        let res = backend.get_object(s3req(get_input("b", "k"))).await.unwrap();
         assert_eq!(res.output.content_length, Some(42));
-        assert_eq!(res.output.e_tag, Some("\"myetag\"".to_string()));
+        assert_eq!(res.output.e_tag, Some(ETag::Strong("myetag".to_string())));
     }
 
     #[tokio::test]
     async fn get_object_missing_key_returns_no_such_key() {
         let backend = make_backend(MockObjectStore::new(), MockBlockStore::new(), 64);
-        match backend.get_object(S3Request::new(get_input("b", "missing"))).await {
+        match backend.get_object(s3req(get_input("b", "missing"))).await {
             Err(e) => assert_eq!(e.code(), &S3ErrorCode::NoSuchKey),
             Ok(_) => panic!("expected NoSuchKey error"),
         }
@@ -2669,7 +2767,7 @@ mod tests {
         let blocks = MockBlockStore::new();
         let backend = make_backend(objects.clone(), blocks.clone(), 64);
 
-        backend.delete_object(S3Request::new(delete_input("b", "k"))).await.unwrap();
+        backend.delete_object(s3req(delete_input("b", "k"))).await.unwrap();
 
         let removed = blocks.removed_refs.lock().unwrap();
         assert!(removed.iter().any(|r| r == "obj:b:k"), "remove_reference not called: {removed:?}");
@@ -2683,7 +2781,7 @@ mod tests {
         let objects = MockObjectStore::new();
         let backend = make_backend(objects.clone(), MockBlockStore::new(), 64);
 
-        backend.delete_object(S3Request::new(delete_input("b", "ghost"))).await.unwrap();
+        backend.delete_object(s3req(delete_input("b", "ghost"))).await.unwrap();
 
         let deleted = objects.delete_calls.lock().unwrap();
         assert_eq!(deleted.as_slice(), &[("b".to_string(), "ghost".to_string())]);
@@ -2708,7 +2806,7 @@ mod tests {
             bypass_governance_retention: None, checksum_algorithm: None,
             expected_bucket_owner: None, mfa: None, request_payer: None,
         };
-        let res = backend.delete_objects(S3Request::new(input)).await.unwrap();
+        let res = backend.delete_objects(s3req(input)).await.unwrap();
         let deleted = res.output.deleted.unwrap_or_default();
         assert_eq!(deleted.len(), 2);
         let errors = res.output.errors.unwrap_or_default();
@@ -2737,15 +2835,15 @@ mod tests {
         let objects = MockObjectStore::with_existing(vec![vec![0u8; 32]], 99, "headetag");
         let backend = make_backend(objects, MockBlockStore::new(), 64);
 
-        let res = backend.head_object(S3Request::new(head_input("b", "k"))).await.unwrap();
+        let res = backend.head_object(s3req(head_input("b", "k"))).await.unwrap();
         assert_eq!(res.output.content_length, Some(99));
-        assert_eq!(res.output.e_tag, Some("\"headetag\"".to_string()));
+        assert_eq!(res.output.e_tag, Some(ETag::Strong("headetag".to_string())));
     }
 
     #[tokio::test]
     async fn head_object_missing_returns_no_such_key() {
         let backend = make_backend(MockObjectStore::new(), MockBlockStore::new(), 64);
-        match backend.head_object(S3Request::new(head_input("b", "gone"))).await {
+        match backend.head_object(s3req(head_input("b", "gone"))).await {
             Err(e) => assert_eq!(e.code(), &S3ErrorCode::NoSuchKey),
             Ok(_) => panic!("expected NoSuchKey error"),
         }
@@ -2760,10 +2858,10 @@ mod tests {
             bucket: "b".to_string(),
             continuation_token: None, delimiter: None, encoding_type: None,
             expected_bucket_owner: None, fetch_owner: None, max_keys: None,
-            optional_object_attributes: vec![],
+            optional_object_attributes: None,
             prefix: None, request_payer: None, start_after: None,
         };
-        let res = backend.list_objects_v2(S3Request::new(input)).await.unwrap();
+        let res = backend.list_objects_v2(s3req(input)).await.unwrap();
         assert_eq!(res.output.key_count, Some(0));
         assert_eq!(res.output.is_truncated, Some(false));
     }
@@ -2774,7 +2872,7 @@ mod tests {
         ListObjectVersionsInput {
             bucket: bucket.to_string(),
             delimiter: None, encoding_type: None, expected_bucket_owner: None,
-            key_marker: None, max_keys: None, optional_object_attributes: vec![],
+            key_marker: None, max_keys: None, optional_object_attributes: None,
             prefix: None, request_payer: None, version_id_marker: None,
         }
     }
@@ -2782,7 +2880,7 @@ mod tests {
     #[tokio::test]
     async fn list_object_versions_empty_bucket() {
         let backend = make_backend(MockObjectStore::new(), MockBlockStore::new(), 64);
-        let res = backend.list_object_versions(S3Request::new(versions_input("b"))).await.unwrap();
+        let res = backend.list_object_versions(s3req(versions_input("b"))).await.unwrap();
         assert_eq!(res.output.versions.as_deref().map(|v| v.len()), Some(0));
         assert_eq!(res.output.is_truncated, Some(false));
         assert_eq!(res.output.name.as_deref(), Some("b"));
@@ -2792,13 +2890,13 @@ mod tests {
     async fn list_object_versions_reports_single_null_version_per_object() {
         let objects = MockObjectStore::with_existing(vec![vec![0u8; 32]], 42, "vetag");
         let backend = make_backend(objects, MockBlockStore::new(), 64);
-        let res = backend.list_object_versions(S3Request::new(versions_input("b"))).await.unwrap();
+        let res = backend.list_object_versions(s3req(versions_input("b"))).await.unwrap();
         let versions = res.output.versions.unwrap();
         assert_eq!(versions.len(), 1);
         let v = &versions[0];
         assert_eq!(v.key.as_deref(), Some("k"));
         assert_eq!(v.size, Some(42));
-        assert_eq!(v.e_tag.as_deref(), Some("\"vetag\""));
+        assert_eq!(v.e_tag.as_ref().map(ETag::value), Some("vetag"));
         assert_eq!(v.version_id.as_deref(), Some("null"));
         assert_eq!(v.is_latest, Some(true));
         assert_eq!(res.output.delete_markers, None);
@@ -2814,12 +2912,14 @@ mod tests {
             upload_id: upload_id.to_string(),
             multipart_upload: Some(CompletedMultipartUpload {
                 parts: Some(vec![
-                    CompletedPart { part_number: Some(1), e_tag: Some("\"aabbccdd\"".to_string()), checksum_crc32: None, checksum_crc32c: None, checksum_crc64nvme: None, checksum_sha1: None, checksum_sha256: None },
-                    CompletedPart { part_number: Some(2), e_tag: Some("\"eeff0011\"".to_string()), checksum_crc32: None, checksum_crc32c: None, checksum_crc64nvme: None, checksum_sha1: None, checksum_sha256: None },
+                    CompletedPart { part_number: Some(1), e_tag: Some(ETag::Strong("aabbccdd".to_string())), ..Default::default() },
+                    CompletedPart { part_number: Some(2), e_tag: Some(ETag::Strong("eeff0011".to_string())), ..Default::default() },
                 ]),
             }),
             checksum_crc32: None, checksum_crc32c: None, checksum_crc64nvme: None,
-            checksum_sha1: None, checksum_sha256: None, checksum_type: None,
+            checksum_md5: None, checksum_sha1: None, checksum_sha256: None,
+            checksum_sha512: None, checksum_type: None, checksum_xxhash128: None,
+            checksum_xxhash3: None, checksum_xxhash64: None,
             expected_bucket_owner: None, if_match: None, if_none_match: None,
             mpu_object_size: None, request_payer: None, sse_customer_algorithm: None,
             sse_customer_key: None, sse_customer_key_md5: None,
@@ -2833,7 +2933,7 @@ mod tests {
         let backend = make_backend(objects.clone(), blocks.clone(), 64);
 
         let upload_id = uuid::Uuid::new_v4();
-        let res = backend.complete_multipart_upload(S3Request::new(
+        let res = backend.complete_multipart_upload(s3req(
             complete_input("b", "k", &upload_id.to_string())
         )).await.unwrap();
 
@@ -2848,7 +2948,7 @@ mod tests {
         let backend = make_backend(objects.clone(), blocks.clone(), 64);
 
         let upload_id = uuid::Uuid::new_v4();
-        backend.complete_multipart_upload(S3Request::new(
+        backend.complete_multipart_upload(s3req(
             complete_input("b", "k", &upload_id.to_string())
         )).await.unwrap();
 
@@ -2870,7 +2970,7 @@ mod tests {
         let upload_id = uuid::Uuid::new_v4();
         let mut input = complete_input("b", "different-key", &upload_id.to_string());
         input.key = "different-key".to_string();
-        match backend.complete_multipart_upload(S3Request::new(input)).await {
+        match backend.complete_multipart_upload(s3req(input)).await {
             Err(e) => assert_eq!(e.code(), &S3ErrorCode::InvalidRequest),
             Ok(_) => panic!("expected InvalidRequest error for key mismatch"),
         }
@@ -2888,7 +2988,7 @@ mod tests {
             upload_id: upload_id.to_string(),
             expected_bucket_owner: None, if_match_initiated_time: None, request_payer: None,
         };
-        backend.abort_multipart_upload(S3Request::new(input)).await.unwrap();
+        backend.abort_multipart_upload(s3req(input)).await.unwrap();
     }
 
     // ── deterministic ETag across chunk strategies ────────────────────────────
@@ -2901,8 +3001,8 @@ mod tests {
 
         async fn etag_for_chunk_size(data: Vec<u8>, chunk: usize) -> String {
             let b = make_backend(MockObjectStore::new(), MockBlockStore::new(), chunk);
-            let res = b.put_object(S3Request::new(put_input("b", "k", data))).await.unwrap();
-            res.output.e_tag.unwrap()
+            let res = b.put_object(s3req(put_input("b", "k", data))).await.unwrap();
+            res.output.e_tag.unwrap().into_value()
         }
 
         let e1 = etag_for_chunk_size(data.clone(), 10).await;

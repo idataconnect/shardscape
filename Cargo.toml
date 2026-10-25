@@ -7,7 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/idataconnect/shardscape"
 
 [dependencies]
-s3s = "0.11.1"
+s3s = "0.17.0"
 tokio = { version = "1.0", features = ["full"] }
 hyper = { version = "1.0", features = ["client", "http1", "server"] }
 blake3 = "1.5"
@@ -37,3 +37,6 @@ http-body = "1.0.1"
 clap = { version = "4.6.1", features = ["derive"] }
 snow = "0.10"
 base64 = "0.22"
+
+[dev-dependencies]
+s3s-sigv4 = "0.17.0"

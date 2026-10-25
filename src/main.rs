@@ -15,11 +15,14 @@ mod chunking;
 mod config;
 mod db;
 mod hashing;
+mod integrity;
 mod storage;
 mod store;
 mod disk;
 mod clock;
 mod noise_transport;
+#[cfg(test)]
+mod wire_tests;
 
 use noise_transport::{NoiseStream, derive_psk, decode_private_key, generate_private_key};
 
@@ -383,7 +386,7 @@ async fn run_server(
     let mut service = S3ServiceBuilder::new((*backend).clone());
     service.set_auth(storage::ShardscapeAuth { db: Arc::clone(&db) });
     let s3 = service.build();
-    let s3_shared = Arc::new(s3.into_shared());
+    let s3_shared = Arc::new(s3);
 
     // --- Internal listener (Noise-encrypted) ---
     let internal_addr: SocketAddr = config.server.internal_bind_addr.parse()?;
@@ -447,8 +450,17 @@ async fn run_server(
             let service_fn = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let svc = svc.clone();
                 async move {
-                    let res: Response<s3s::Body> = svc.call(req).await?;
-                    Ok::<_, anyhow::Error>(res)
+                    let (method, uri) = (req.method().clone(), req.uri().clone());
+                    let res: Response<s3s::Body> = match svc.call(req).await {
+                        Ok(res) => res,
+                        Err(e) => {
+                            // s3s could not produce a response at all; hyper
+                            // drops the connection, so log the reason here.
+                            warn!(%method, path = uri.path(), error = ?e, "S3 request failed without a response");
+                            return Err(anyhow::Error::from(e));
+                        }
+                    };
+                    Ok::<_, anyhow::Error>(storage::log_server_error(&method, &uri, res).await)
                 }
             });
             if let Err(err) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
