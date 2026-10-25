@@ -717,8 +717,8 @@ pub async fn log_server_error(method: &hyper::Method, uri: &hyper::Uri, res: s3s
     let bytes = body.store_all_limited(64 * 1024).await.unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes);
     let code = xml_text(&text, "Code").unwrap_or("-");
-    let message = xml_text(&text, "Message").unwrap_or("-");
-    tracing::warn!(status = parts.status.as_u16(), %method, path = uri.path(), code, message, "S3 request failed");
+    let reason = xml_text(&text, "Message").unwrap_or("-");
+    tracing::warn!(status = parts.status.as_u16(), %method, path = uri.path(), code, reason, "S3 request failed");
     hyper::Response::from_parts(parts, s3s::Body::from(bytes))
 }
 
