@@ -164,7 +164,9 @@ node.
 ## Limitations
 
 - **No S3 object versioning** — each key holds one version, resolved by
-  last-write-wins. `ListObjectVersions` is not supported.
+  last-write-wins. `ListObjectVersions` works, and reports every object as a
+  single latest version with the `null` version id, as S3 does for a bucket
+  that has never had versioning enabled.
 - **LWW conflict resolution** — concurrent writes to the same key from different
   sites resolve by timestamp; there is no conflict detection or multi-version
   concurrency.
