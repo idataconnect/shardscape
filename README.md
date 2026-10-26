@@ -35,8 +35,11 @@ of sites.
   `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`), and verifies every
   `x-amz-checksum-*` value (CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256, SHA-512,
   MD5, XXHASH64/3/128, as header or trailer) and `Content-MD5` against the bytes
-  received, rejecting a mismatch with `BadDigest`. No client-side
-  `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` workaround is needed
+  received, rejecting a mismatch with `BadDigest`. Multipart uploads get the
+  whole-object checksum too (`FULL_OBJECT` CRCs or `COMPOSITE`), built from
+  the verified part checksums, and CompleteMultipartUpload checks every listed
+  part's ETag and checksum. You don't need the client-side
+  `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` workaround
 - **Content-addressed deduplication** — identical data is stored once, globally
 - **Async replication** — sites converge without consensus; no quorum needed
 - **Offline-tolerant** — a site can be offline for weeks and rejoin cleanly

@@ -13,7 +13,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use hyper::HeaderMap;
 use s3s::checksum::ChecksumHasher;
-use s3s::dto::{Checksum, ChecksumAlgorithm};
+use s3s::dto::{Checksum, ChecksumAlgorithm, ChecksumType};
 use s3s::{S3Error, S3ErrorCode, S3Result};
 
 /// The checksum algorithms S3 defines, keyed by their `x-amz-checksum-*`
@@ -125,8 +125,11 @@ impl Algo {
 pub struct Expected {
     /// `x-amz-checksum-*` values sent as ordinary request headers.
     pub headers: Checksum,
-    /// `x-amz-sdk-checksum-algorithm`.
-    pub algorithm: Option<ChecksumAlgorithm>,
+    /// Algorithms to compute even without a value to check against: the
+    /// client's `x-amz-sdk-checksum-algorithm`, and for an UploadPart the
+    /// algorithm its multipart upload declared, so every part has the
+    /// checksum the whole-object checksum is later built from.
+    pub algorithms: Vec<String>,
     /// `Content-MD5` (base64).
     pub content_md5: Option<String>,
 }
@@ -157,10 +160,9 @@ impl BodyVerifier {
             let wanted = algo.field(&expected.headers).is_some()
                 || trailed.contains(&algo)
                 || expected
-                    .algorithm
-                    .as_ref()
-                    .and_then(|a| Algo::from_name(a.as_str()))
-                    == Some(algo);
+                    .algorithms
+                    .iter()
+                    .any(|a| Algo::from_name(a) == Some(algo));
             if wanted {
                 algo.enable(&mut hasher);
             }
@@ -228,6 +230,157 @@ impl BodyVerifier {
         }
         Ok(computed)
     }
+}
+
+// ── multipart ────────────────────────────────────────────────────────────────
+
+/// The canonical upper-case name of an S3 checksum algorithm, or `None` if
+/// `name` is not one.
+pub fn algorithm_name(name: &str) -> Option<&'static str> {
+    Algo::from_name(name).map(Algo::name)
+}
+
+/// Whether S3 allows the `FULL_OBJECT` checksum type for `algorithm` (only
+/// the CRCs, whose per-part values can be combined into the whole object's).
+pub fn supports_full_object(algorithm: &str) -> bool {
+    crc_algorithm(algorithm).is_some()
+}
+
+/// The checksum type S3 uses for a multipart upload when the client names
+/// none: `FULL_OBJECT` for CRC64NVME (its only allowed type), else `COMPOSITE`.
+pub fn default_checksum_type(algorithm: &str) -> &'static str {
+    match Algo::from_name(algorithm) {
+        Some(Algo::Crc64Nvme) => ChecksumType::FULL_OBJECT,
+        _ => ChecksumType::COMPOSITE,
+    }
+}
+
+/// The value for `algorithm` in `c`.
+pub fn checksum_value<'a>(c: &'a Checksum, algorithm: &str) -> Option<&'a String> {
+    Algo::from_name(algorithm).and_then(|a| a.field(c))
+}
+
+/// The first algorithm (in S3's order) that `c` carries a value for.
+pub fn first_algorithm(c: &Checksum) -> Option<&'static str> {
+    ALL.into_iter()
+        .find(|a| a.field(c).is_some())
+        .map(Algo::name)
+}
+
+/// Set the value for `algorithm` in `c`.
+pub fn set_checksum(c: &mut Checksum, algorithm: &str, value: String) {
+    let slot = match Algo::from_name(algorithm) {
+        Some(Algo::Crc32) => &mut c.checksum_crc32,
+        Some(Algo::Crc32c) => &mut c.checksum_crc32c,
+        Some(Algo::Crc64Nvme) => &mut c.checksum_crc64nvme,
+        Some(Algo::Sha1) => &mut c.checksum_sha1,
+        Some(Algo::Sha256) => &mut c.checksum_sha256,
+        Some(Algo::Sha512) => &mut c.checksum_sha512,
+        Some(Algo::Md5) => &mut c.checksum_md5,
+        Some(Algo::XxHash64) => &mut c.checksum_xxhash64,
+        Some(Algo::XxHash3) => &mut c.checksum_xxhash3,
+        Some(Algo::XxHash128) => &mut c.checksum_xxhash128,
+        None => return,
+    };
+    *slot = Some(value);
+}
+
+/// Serialize a part's verified checksums for storage as `ALGO:base64` pairs
+/// joined by `,` (neither separator occurs in base64).
+pub fn encode_checksums(c: &Checksum) -> String {
+    ALL.into_iter()
+        .filter_map(|a| a.field(c).map(|v| format!("{}:{v}", a.name())))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The inverse of [`encode_checksums`].
+pub fn decode_checksums(encoded: &str) -> Checksum {
+    let mut c = Checksum::default();
+    for (name, value) in encoded.split(',').filter_map(|kv| kv.split_once(':')) {
+        set_checksum(&mut c, name, value.to_string());
+    }
+    c
+}
+
+/// Check the checksums a CompleteMultipartUpload request lists for a part
+/// against the ones verified when the part was uploaded. Returns the name of
+/// the first algorithm that does not match (or that the part was uploaded
+/// without, so it cannot be confirmed).
+pub fn check_part_checksums(claimed: &Checksum, stored: &Checksum) -> Result<(), &'static str> {
+    for algo in ALL {
+        if let Some(claim) = algo.field(claimed)
+            && algo.field(stored) != Some(claim)
+        {
+            return Err(algo.name());
+        }
+    }
+    Ok(())
+}
+
+fn crc_algorithm(algorithm: &str) -> Option<crc_fast::CrcAlgorithm> {
+    match Algo::from_name(algorithm)? {
+        Algo::Crc32 => Some(crc_fast::CrcAlgorithm::Crc32IsoHdlc),
+        Algo::Crc32c => Some(crc_fast::CrcAlgorithm::Crc32Iscsi),
+        Algo::Crc64Nvme => Some(crc_fast::CrcAlgorithm::Crc64Nvme),
+        _ => None,
+    }
+}
+
+/// The whole-object checksum of a multipart upload, built from each part's
+/// checksum (base64) and size, in part order, without re-reading the data.
+///
+/// - `FULL_OBJECT` (CRCs only): the CRC of the concatenated object, by
+///   combining the part CRCs.
+/// - `COMPOSITE`: S3's checksum-of-checksums, `base64(H(raw1 ‖ raw2 ‖ …))-N`.
+pub fn multipart_checksum(
+    algorithm: &str,
+    full_object: bool,
+    parts: &[(&str, i64)],
+) -> Result<String, String> {
+    let raw: Vec<Vec<u8>> = parts
+        .iter()
+        .map(|(v, _)| {
+            BASE64
+                .decode(v)
+                .map_err(|e| format!("stored part checksum {v:?} is not base64: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let algo = Algo::from_name(algorithm)
+        .ok_or_else(|| format!("unknown checksum algorithm {algorithm}"))?;
+
+    if full_object {
+        let crc = crc_algorithm(algorithm)
+            .ok_or_else(|| format!("{algorithm} has no FULL_OBJECT checksum"))?;
+        let width = if algo == Algo::Crc64Nvme { 8 } else { 4 };
+        let mut combined: Option<u64> = None;
+        for (bytes, (_, size)) in raw.iter().zip(parts) {
+            if bytes.len() != width {
+                return Err(format!(
+                    "stored part {algorithm} is {} bytes, expected {width}",
+                    bytes.len()
+                ));
+            }
+            let value = bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+            combined = Some(match combined {
+                None => value,
+                Some(acc) => crc_fast::checksum_combine(crc, acc, value, *size as u64),
+            });
+        }
+        let combined = combined.ok_or("no parts")?;
+        return Ok(BASE64.encode(&combined.to_be_bytes()[8 - width..]));
+    }
+
+    let mut hasher = ChecksumHasher::default();
+    algo.enable(&mut hasher);
+    for bytes in &raw {
+        hasher.update(bytes);
+    }
+    let digest = algo
+        .field(&hasher.finalize())
+        .cloned()
+        .ok_or("hasher produced no digest")?;
+    Ok(format!("{digest}-{}", parts.len()))
 }
 
 #[cfg(test)]
@@ -344,5 +497,87 @@ mod tests {
             v.finish(Some(&trailers), &md5_of(data))
                 .unwrap_or_else(|e| panic!("{algo:?}: {e}"));
         }
+    }
+
+    #[test]
+    fn full_object_crc_combines_part_crcs_into_the_whole_objects() {
+        let parts: [&[u8]; 3] = [b"first part, ", b"", b"and the second, longer part"];
+        let whole: Vec<u8> = parts.concat();
+        for (name, digest) in [
+            ("CRC32", BASE64.encode(s3s::crypto::Crc32::checksum(&whole))),
+            (
+                "CRC32C",
+                BASE64.encode(s3s::crypto::Crc32c::checksum(&whole)),
+            ),
+            (
+                "CRC64NVME",
+                BASE64.encode(s3s::crypto::Crc64Nvme::checksum(&whole)),
+            ),
+        ] {
+            let per_part: Vec<(String, i64)> = parts
+                .iter()
+                .map(|p| {
+                    let mut h = ChecksumHasher::default();
+                    Algo::from_name(name).unwrap().enable(&mut h);
+                    h.update(p);
+                    (
+                        checksum_value(&h.finalize(), name).unwrap().clone(),
+                        p.len() as i64,
+                    )
+                })
+                .collect();
+            let refs: Vec<(&str, i64)> = per_part.iter().map(|(v, n)| (v.as_str(), *n)).collect();
+            assert_eq!(
+                multipart_checksum(name, true, &refs).unwrap(),
+                digest,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_checksum_is_checksum_of_raw_part_checksums() {
+        let (a, b) = (
+            s3s::crypto::Crc32c::checksum(b"aaa"),
+            s3s::crypto::Crc32c::checksum(b"bb"),
+        );
+        let want = format!(
+            "{}-2",
+            BASE64.encode(s3s::crypto::Crc32c::checksum(&[a, b].concat()))
+        );
+        let parts = [(BASE64.encode(a), 3), (BASE64.encode(b), 2)];
+        let refs: Vec<(&str, i64)> = parts.iter().map(|(v, n)| (v.as_str(), *n)).collect();
+        assert_eq!(multipart_checksum("CRC32C", false, &refs).unwrap(), want);
+        // SHA-256 has no full-object form.
+        assert!(multipart_checksum("SHA256", true, &refs).is_err());
+    }
+
+    #[test]
+    fn part_checksums_encode_round_trip_and_compare() {
+        let c = Checksum {
+            checksum_crc64nvme: Some("AAAAAAAAAAA=".into()),
+            checksum_sha256: Some("n4bQgYhMfWWaL+qgxVrQFaO/TxsrC4Is0V1sFbDwCgg=".into()),
+            ..Default::default()
+        };
+        let encoded = encode_checksums(&c);
+        assert_eq!(decode_checksums(&encoded), c);
+        assert_eq!(decode_checksums(""), Checksum::default());
+
+        let claim = Checksum {
+            checksum_crc64nvme: Some("AAAAAAAAAAA=".into()),
+            ..Default::default()
+        };
+        assert_eq!(check_part_checksums(&claim, &c), Ok(()));
+        let wrong = Checksum {
+            checksum_crc64nvme: Some("AAAAAAAAAAE=".into()),
+            ..Default::default()
+        };
+        assert_eq!(check_part_checksums(&wrong, &c), Err("CRC64NVME"));
+        // A claim for an algorithm the part was not uploaded with cannot be confirmed.
+        let other = Checksum {
+            checksum_crc32: Some("AAAAAA==".into()),
+            ..Default::default()
+        };
+        assert_eq!(check_part_checksums(&other, &c), Err("CRC32"));
     }
 }

@@ -1962,6 +1962,7 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "crc-fast",
  "fastcdc",
  "futures-util",
  "hex",

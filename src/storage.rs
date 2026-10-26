@@ -5,6 +5,7 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use reqwest::Client;
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, auth::*, dto::*};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
@@ -12,7 +13,46 @@ use crate::chunking::ChunkingStrategy;
 use crate::config::Config;
 use crate::db::Db;
 use crate::hashing::compute_shard_id;
+use crate::store::{PartRecord, UploadRecord};
 use md5::{Digest, Md5};
+
+/// The ten `checksum_*` fields that S3 DTOs carrying checksums (PutObject,
+/// UploadPart, CompletedPart, CompleteMultipartUpload, ...) all share,
+/// gathered into a `Checksum`.
+macro_rules! checksum_of {
+    ($src:expr) => {
+        Checksum {
+            checksum_crc32: $src.checksum_crc32.clone(),
+            checksum_crc32c: $src.checksum_crc32c.clone(),
+            checksum_crc64nvme: $src.checksum_crc64nvme.clone(),
+            checksum_md5: $src.checksum_md5.clone(),
+            checksum_sha1: $src.checksum_sha1.clone(),
+            checksum_sha256: $src.checksum_sha256.clone(),
+            checksum_sha512: $src.checksum_sha512.clone(),
+            checksum_xxhash128: $src.checksum_xxhash128.clone(),
+            checksum_xxhash3: $src.checksum_xxhash3.clone(),
+            checksum_xxhash64: $src.checksum_xxhash64.clone(),
+            ..Default::default()
+        }
+    };
+}
+
+/// Copy a `Checksum` into the ten `checksum_*` fields of an S3 output DTO.
+macro_rules! set_checksums {
+    ($dst:expr, $c:expr) => {{
+        let c: Checksum = $c;
+        $dst.checksum_crc32 = c.checksum_crc32;
+        $dst.checksum_crc32c = c.checksum_crc32c;
+        $dst.checksum_crc64nvme = c.checksum_crc64nvme;
+        $dst.checksum_md5 = c.checksum_md5;
+        $dst.checksum_sha1 = c.checksum_sha1;
+        $dst.checksum_sha256 = c.checksum_sha256;
+        $dst.checksum_sha512 = c.checksum_sha512;
+        $dst.checksum_xxhash128 = c.checksum_xxhash128;
+        $dst.checksum_xxhash3 = c.checksum_xxhash3;
+        $dst.checksum_xxhash64 = c.checksum_xxhash64;
+    }};
+}
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
@@ -55,31 +95,30 @@ pub trait ObjectStore: Send + Sync {
     async fn create_multipart_upload(
         &self,
         bucket: &str,
-        key: &str,
         upload_id: uuid::Uuid,
+        upload: &UploadRecord,
     ) -> Result<(), anyhow::Error>;
 
-    async fn get_multipart_upload_key(
+    async fn get_multipart_upload(
         &self,
         bucket: &str,
         upload_id: uuid::Uuid,
-    ) -> Result<Option<String>, anyhow::Error>;
+    ) -> Result<Option<UploadRecord>, anyhow::Error>;
 
+    /// Record (or replace) one uploaded part.
     async fn insert_part(
         &self,
         bucket: &str,
         upload_id: uuid::Uuid,
-        part_number: i32,
-        blocks: Vec<Vec<u8>>,
-        size: i64,
-        etag: &str,
+        part: &PartRecord,
     ) -> Result<(), anyhow::Error>;
 
+    /// The upload's parts, ascending by part number.
     async fn list_parts(
         &self,
         bucket: &str,
         upload_id: uuid::Uuid,
-    ) -> Result<Vec<(i32, Vec<Vec<u8>>, i64, String)>, anyhow::Error>;
+    ) -> Result<Vec<PartRecord>, anyhow::Error>;
 
     async fn delete_multipart_upload(
         &self,
@@ -295,44 +334,40 @@ impl ObjectStore for Db {
     async fn create_multipart_upload(
         &self,
         bucket: &str,
-        key: &str,
         upload_id: uuid::Uuid,
+        upload: &UploadRecord,
     ) -> Result<(), anyhow::Error> {
         // The inherent method is named `insert_multipart` (args: bucket, upload_id,
         // key). Calling `self.create_multipart_upload(..)` here resolved back to
         // THIS trait method — unbounded async recursion that overflowed the stack
         // and SIGABRT'd the whole node on any multipart PUT (aws switches to
         // multipart above 8MB).
-        self.insert_multipart(bucket, upload_id, key).await
+        self.insert_multipart(bucket, upload_id, upload).await
     }
 
-    async fn get_multipart_upload_key(
+    async fn get_multipart_upload(
         &self,
         bucket: &str,
         upload_id: uuid::Uuid,
-    ) -> Result<Option<String>, anyhow::Error> {
-        // Inherent method is `get_multipart_key`; same self-recursion bug as above.
-        self.get_multipart_key(bucket, upload_id).await
+    ) -> Result<Option<UploadRecord>, anyhow::Error> {
+        // Inherent method is `get_multipart`; same self-recursion bug as above.
+        self.get_multipart(bucket, upload_id).await
     }
 
     async fn insert_part(
         &self,
         bucket: &str,
         upload_id: uuid::Uuid,
-        part_number: i32,
-        blocks: Vec<Vec<u8>>,
-        size: i64,
-        etag: &str,
+        part: &PartRecord,
     ) -> Result<(), anyhow::Error> {
-        self.insert_part(bucket, upload_id, part_number, blocks, size, etag)
-            .await
+        self.insert_part(bucket, upload_id, part).await
     }
 
     async fn list_parts(
         &self,
         bucket: &str,
         upload_id: uuid::Uuid,
-    ) -> Result<Vec<(i32, Vec<Vec<u8>>, i64, String)>, anyhow::Error> {
+    ) -> Result<Vec<PartRecord>, anyhow::Error> {
         self.list_parts(bucket, upload_id).await
     }
 
@@ -1112,6 +1147,95 @@ impl StorageBackend {
         })
     }
 
+    /// The whole-object checksum of a completed multipart upload, verified
+    /// against the one the client sent with CompleteMultipartUpload (if any).
+    ///
+    /// The algorithm is the one the upload declared at CreateMultipartUpload,
+    /// else the one the Complete request carries a value for; with neither
+    /// there is nothing to compute. It is built from the per-part checksums
+    /// verified at upload time (full-object CRC or composite), never by
+    /// re-reading the data.
+    fn multipart_object_checksum(
+        &self,
+        upload: &UploadRecord,
+        input: &CompleteMultipartUploadInput,
+        parts: &[PartRecord],
+    ) -> S3Result<Checksum> {
+        let sent = checksum_of!(input);
+        let algorithm = upload
+            .checksum_algorithm
+            .as_deref()
+            .and_then(crate::integrity::algorithm_name)
+            .or_else(|| crate::integrity::first_algorithm(&sent));
+        let Some(algorithm) = algorithm else {
+            return Ok(Checksum::default());
+        };
+        let checksum_type = input
+            .checksum_type
+            .as_ref()
+            .map(|t| t.as_str().to_ascii_uppercase())
+            .or_else(|| upload.checksum_type.clone())
+            .unwrap_or_else(|| crate::integrity::default_checksum_type(algorithm).to_owned());
+        let full_object = checksum_type == ChecksumType::FULL_OBJECT;
+        if full_object && !crate::integrity::supports_full_object(algorithm) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!(
+                    "The {algorithm} checksum algorithm does not support the FULL_OBJECT checksum type"
+                ),
+            ));
+        }
+        let sent_value = crate::integrity::checksum_value(&sent, algorithm);
+
+        let mut part_values = Vec::with_capacity(parts.len());
+        for part in parts {
+            let stored = crate::integrity::decode_checksums(&part.checksums);
+            match crate::integrity::checksum_value(&stored, algorithm) {
+                Some(v) => part_values.push((v.clone(), part.size)),
+                // A part uploaded before the algorithm was known (e.g. by an
+                // older shardscape): the object checksum cannot be computed.
+                None if sent_value.is_none() => return Ok(Checksum::default()),
+                None => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidRequest,
+                        format!(
+                            "Part {} was uploaded without a {algorithm} checksum, so the object's cannot be verified",
+                            part.part_number
+                        ),
+                    ));
+                }
+            }
+        }
+        let refs: Vec<(&str, i64)> = part_values.iter().map(|(v, n)| (v.as_str(), *n)).collect();
+        let computed = crate::integrity::multipart_checksum(algorithm, full_object, &refs)
+            .map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("multipart checksum: {e}"),
+                )
+            })?;
+
+        if let Some(sent) = sent_value {
+            // A composite value may be sent with or without its `-N` suffix.
+            let base = computed
+                .split_once('-')
+                .map_or(computed.as_str(), |(b, _)| b);
+            if sent.as_str() != computed && sent.as_str() != base {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::BadDigest,
+                    format!("The {algorithm} you specified did not match the calculated checksum."),
+                ));
+            }
+        }
+
+        let mut checksum = Checksum {
+            checksum_type: Some(ChecksumType::from(checksum_type)),
+            ..Default::default()
+        };
+        crate::integrity::set_checksum(&mut checksum, algorithm, computed);
+        Ok(checksum)
+    }
+
     /// Returns a 503 if the disk guard has tripped, so local S3 writes are
     /// rejected cleanly (the client retries later / against the write master)
     /// rather than the node marching the volume into ENOSPC.
@@ -1392,20 +1516,12 @@ impl S3 for StorageBackend {
         let shard_id = compute_shard_id(&key);
 
         let expected = crate::integrity::Expected {
-            headers: Checksum {
-                checksum_crc32: input.checksum_crc32,
-                checksum_crc32c: input.checksum_crc32c,
-                checksum_crc64nvme: input.checksum_crc64nvme,
-                checksum_md5: input.checksum_md5,
-                checksum_sha1: input.checksum_sha1,
-                checksum_sha256: input.checksum_sha256,
-                checksum_sha512: input.checksum_sha512,
-                checksum_xxhash128: input.checksum_xxhash128,
-                checksum_xxhash3: input.checksum_xxhash3,
-                checksum_xxhash64: input.checksum_xxhash64,
-                ..Default::default()
-            },
-            algorithm: input.checksum_algorithm,
+            headers: checksum_of!(input),
+            algorithms: input
+                .checksum_algorithm
+                .iter()
+                .map(|a| a.as_str().to_owned())
+                .collect(),
             content_md5: input.content_md5,
         };
         let body = input
@@ -1442,20 +1558,11 @@ impl S3 for StorageBackend {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let output = PutObjectOutput {
+        let mut output = PutObjectOutput {
             e_tag: Some(ETag::Strong(etag.to_string())),
-            checksum_crc32: checksum.checksum_crc32,
-            checksum_crc32c: checksum.checksum_crc32c,
-            checksum_crc64nvme: checksum.checksum_crc64nvme,
-            checksum_md5: checksum.checksum_md5,
-            checksum_sha1: checksum.checksum_sha1,
-            checksum_sha256: checksum.checksum_sha256,
-            checksum_sha512: checksum.checksum_sha512,
-            checksum_xxhash128: checksum.checksum_xxhash128,
-            checksum_xxhash3: checksum.checksum_xxhash3,
-            checksum_xxhash64: checksum.checksum_xxhash64,
             ..Default::default()
         };
+        set_checksums!(output, checksum);
         Ok(S3Response::new(output))
     }
 
@@ -2010,9 +2117,9 @@ impl S3 for StorageBackend {
         let upload_id = uuid::Uuid::parse_str(&input.upload_id)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid upload id"))?;
 
-        let _key = self
+        let upload = self
             .objects
-            .get_multipart_upload_key(&input.bucket, upload_id)
+            .get_multipart_upload(&input.bucket, upload_id)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchUpload, "Upload not found"))?;
@@ -2028,19 +2135,23 @@ impl S3 for StorageBackend {
 
         let filtered: Vec<_> = parts
             .into_iter()
-            .filter(|(n, _, _, _)| *n > part_number_marker)
+            .filter(|p| p.part_number > part_number_marker)
             .collect();
         let is_truncated = filtered.len() > max_parts;
 
         let result_parts: Vec<Part> = filtered
             .into_iter()
             .take(max_parts)
-            .map(|(num, _blocks, size, etag)| Part {
-                part_number: Some(num),
-                size: Some(size),
-                e_tag: Some(ETag::Strong(etag.to_string())),
-                last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
-                ..Default::default()
+            .map(|p| {
+                let mut part = Part {
+                    part_number: Some(p.part_number),
+                    size: Some(p.size),
+                    e_tag: Some(ETag::Strong(p.etag)),
+                    last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
+                    ..Default::default()
+                };
+                set_checksums!(part, crate::integrity::decode_checksums(&p.checksums));
+                part
             })
             .collect();
 
@@ -2054,6 +2165,8 @@ impl S3 for StorageBackend {
             bucket: Some(input.bucket),
             key: Some(input.key),
             upload_id: Some(input.upload_id),
+            checksum_algorithm: upload.checksum_algorithm.map(ChecksumAlgorithm::from),
+            checksum_type: upload.checksum_type.map(ChecksumType::from),
             parts: Some(result_parts),
             max_parts: Some(max_parts as i32),
             is_truncated: Some(is_truncated),
@@ -2141,9 +2254,9 @@ impl S3 for StorageBackend {
         let upload_id = uuid::Uuid::parse_str(&input.upload_id)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid upload id"))?;
 
-        let _key = self
+        let upload = self
             .objects
-            .get_multipart_upload_key(&input.bucket, upload_id)
+            .get_multipart_upload(&input.bucket, upload_id)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchUpload, "Upload not found"))?;
@@ -2197,6 +2310,15 @@ impl S3 for StorageBackend {
         let mut block_hashes: Vec<Vec<u8>> = Vec::new();
         let mut total_size: i64 = 0;
         let mut md5 = Md5::new();
+        // Compute the upload's declared checksum over the copied bytes too, so
+        // a copied part can take part in the whole-object checksum.
+        let mut verifier = crate::integrity::BodyVerifier::new(
+            &hyper::HeaderMap::new(),
+            crate::integrity::Expected {
+                algorithms: upload.checksum_algorithm.into_iter().collect(),
+                ..Default::default()
+            },
+        );
         let ref_id = format!("upload:{}:{}", input.bucket, input.upload_id);
 
         let initial_capacity = match self.config.storage.chunking {
@@ -2212,6 +2334,7 @@ impl S3 for StorageBackend {
                 })?;
             let sliced = slice_block_bytes(data, skip, Some(take));
             md5.update(&sliced);
+            verifier.update(&sliced);
             current_chunk.extend_from_slice(&sliced);
 
             for block_data in self.chunker.process(&mut current_chunk) {
@@ -2239,25 +2362,32 @@ impl S3 for StorageBackend {
             block_hashes.push(hash);
         }
 
-        let etag = hex::encode(md5.finalize());
+        let md5 = md5.finalize();
+        let etag = hex::encode(md5);
+        let checksum = verifier.finish(None, &md5)?;
         self.objects
             .insert_part(
                 &input.bucket,
                 upload_id,
-                input.part_number,
-                block_hashes,
-                total_size,
-                &etag,
+                &PartRecord {
+                    part_number: input.part_number,
+                    blocks: block_hashes,
+                    size: total_size,
+                    etag: etag.clone(),
+                    checksums: crate::integrity::encode_checksums(&checksum),
+                },
             )
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
+        let mut result = CopyPartResult {
+            e_tag: Some(ETag::Strong(etag.to_string())),
+            last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
+            ..Default::default()
+        };
+        set_checksums!(result, checksum);
         let output = UploadPartCopyOutput {
-            copy_part_result: Some(CopyPartResult {
-                e_tag: Some(ETag::Strong(etag.to_string())),
-                last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
-                ..Default::default()
-            }),
+            copy_part_result: Some(result),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -2277,8 +2407,53 @@ impl S3 for StorageBackend {
         let input = req.input;
         let upload_id = uuid::Uuid::new_v4();
 
+        let checksum_algorithm = match &input.checksum_algorithm {
+            None => None,
+            Some(a) => Some(crate::integrity::algorithm_name(a.as_str()).ok_or_else(|| {
+                S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    format!("Unsupported checksum algorithm {}", a.as_str()),
+                )
+            })?),
+        };
+        let checksum_type = match (checksum_algorithm, &input.checksum_type) {
+            (None, Some(_)) => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "x-amz-checksum-type requires x-amz-checksum-algorithm",
+                ));
+            }
+            (None, None) => None,
+            (Some(alg), t) => {
+                let t = t
+                    .as_ref()
+                    .map(|t| t.as_str().to_ascii_uppercase())
+                    .unwrap_or_else(|| crate::integrity::default_checksum_type(alg).to_owned());
+                let valid = match t.as_str() {
+                    ChecksumType::FULL_OBJECT => crate::integrity::supports_full_object(alg),
+                    // CRC64NVME only has a full-object form.
+                    ChecksumType::COMPOSITE => alg != ChecksumAlgorithm::CRC64NVME,
+                    _ => false,
+                };
+                if !valid {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidRequest,
+                        format!(
+                            "The {alg} checksum algorithm does not support the {t} checksum type"
+                        ),
+                    ));
+                }
+                Some(t)
+            }
+        };
+
+        let upload = UploadRecord {
+            key: input.key.clone(),
+            checksum_algorithm: checksum_algorithm.map(str::to_owned),
+            checksum_type: checksum_type.clone(),
+        };
         self.objects
-            .create_multipart_upload(&input.bucket, &input.key, upload_id)
+            .create_multipart_upload(&input.bucket, upload_id, &upload)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
@@ -2286,6 +2461,8 @@ impl S3 for StorageBackend {
             bucket: Some(input.bucket),
             key: Some(input.key),
             upload_id: Some(upload_id.to_string()),
+            checksum_algorithm: checksum_algorithm.map(|a| ChecksumAlgorithm::from(a.to_owned())),
+            checksum_type: checksum_type.map(ChecksumType::from),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -2307,29 +2484,24 @@ impl S3 for StorageBackend {
         let upload_id = uuid::Uuid::parse_str(&input.upload_id)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid upload id"))?;
 
-        // Verify upload exists and get key
-        let _key = self
+        // Verify the upload exists; its declared checksum algorithm (if any) is
+        // computed for every part.
+        let upload = self
             .objects
-            .get_multipart_upload_key(&input.bucket, upload_id)
+            .get_multipart_upload(&input.bucket, upload_id)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchUpload, "Upload not found"))?;
 
+        let mut algorithms: Vec<String> = input
+            .checksum_algorithm
+            .iter()
+            .map(|a| a.as_str().to_owned())
+            .collect();
+        algorithms.extend(upload.checksum_algorithm);
         let expected = crate::integrity::Expected {
-            headers: Checksum {
-                checksum_crc32: input.checksum_crc32,
-                checksum_crc32c: input.checksum_crc32c,
-                checksum_crc64nvme: input.checksum_crc64nvme,
-                checksum_md5: input.checksum_md5,
-                checksum_sha1: input.checksum_sha1,
-                checksum_sha256: input.checksum_sha256,
-                checksum_sha512: input.checksum_sha512,
-                checksum_xxhash128: input.checksum_xxhash128,
-                checksum_xxhash3: input.checksum_xxhash3,
-                checksum_xxhash64: input.checksum_xxhash64,
-                ..Default::default()
-            },
-            algorithm: input.checksum_algorithm,
+            headers: checksum_of!(input),
+            algorithms,
             content_md5: input.content_md5,
         };
         let body = input
@@ -2355,28 +2527,22 @@ impl S3 for StorageBackend {
             .insert_part(
                 &input.bucket,
                 upload_id,
-                input.part_number,
-                block_hashes,
-                total_size,
-                &etag,
+                &PartRecord {
+                    part_number: input.part_number,
+                    blocks: block_hashes,
+                    size: total_size,
+                    etag: etag.clone(),
+                    checksums: crate::integrity::encode_checksums(&checksum),
+                },
             )
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let output = UploadPartOutput {
+        let mut output = UploadPartOutput {
             e_tag: Some(ETag::Strong(etag.to_string())),
-            checksum_crc32: checksum.checksum_crc32,
-            checksum_crc32c: checksum.checksum_crc32c,
-            checksum_crc64nvme: checksum.checksum_crc64nvme,
-            checksum_md5: checksum.checksum_md5,
-            checksum_sha1: checksum.checksum_sha1,
-            checksum_sha256: checksum.checksum_sha256,
-            checksum_sha512: checksum.checksum_sha512,
-            checksum_xxhash128: checksum.checksum_xxhash128,
-            checksum_xxhash3: checksum.checksum_xxhash3,
-            checksum_xxhash64: checksum.checksum_xxhash64,
             ..Default::default()
         };
+        set_checksums!(output, checksum);
         Ok(S3Response::new(output))
     }
 
@@ -2395,14 +2561,14 @@ impl S3 for StorageBackend {
         let upload_id = uuid::Uuid::parse_str(&input.upload_id)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid upload id"))?;
 
-        let stored_key = self
+        let upload = self
             .objects
-            .get_multipart_upload_key(&input.bucket, upload_id)
+            .get_multipart_upload(&input.bucket, upload_id)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchUpload, "Upload not found"))?;
 
-        if stored_key != input.key {
+        if upload.key != input.key {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
                 "Key in request does not match key for this upload",
@@ -2410,37 +2576,95 @@ impl S3 for StorageBackend {
         }
         let key = input.key.clone();
 
-        let mut parts = self
+        let mut stored: HashMap<i32, PartRecord> = self
             .objects
             .list_parts(&input.bucket, upload_id)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
+            .into_iter()
+            .map(|p| (p.part_number, p))
+            .collect();
 
-        // Sort parts by part number
-        parts.sort_by_key(|(num, _, _, _)| *num);
+        // The object is exactly the parts the request lists, in that order (S3
+        // semantics): uploaded parts it leaves out are discarded with the upload.
+        // Each listed part must exist and match the ETag and any checksum the
+        // client recorded for it, so a part mixed up or replaced since the client
+        // uploaded it cannot slip into the object.
+        let requested = input
+            .multipart_upload
+            .as_ref()
+            .and_then(|m| m.parts.as_deref())
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                S3Error::with_message(
+                    S3ErrorCode::MalformedXML,
+                    "The XML you provided was not well-formed or did not validate against our published schema: no parts listed",
+                )
+            })?;
+        let mut parts: Vec<PartRecord> = Vec::with_capacity(requested.len());
+        for completed in requested {
+            let n = completed.part_number.ok_or_else(|| {
+                S3Error::with_message(S3ErrorCode::InvalidPart, "A listed part has no PartNumber")
+            })?;
+            if parts.last().is_some_and(|prev| n <= prev.part_number) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidPartOrder,
+                    "The list of parts was not in ascending order. Parts must be ordered by part number.",
+                ));
+            }
+            let part = stored.remove(&n).ok_or_else(|| {
+                S3Error::with_message(
+                    S3ErrorCode::InvalidPart,
+                    format!("Part {n} was not uploaded"),
+                )
+            })?;
+            if let Some(etag) = &completed.e_tag
+                && etag.value().trim_matches('"') != part.etag
+            {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidPart,
+                    format!("The ETag listed for part {n} does not match the uploaded part"),
+                ));
+            }
+            let stored_checksums = crate::integrity::decode_checksums(&part.checksums);
+            if let Err(alg) =
+                crate::integrity::check_part_checksums(&checksum_of!(completed), &stored_checksums)
+            {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidPart,
+                    format!(
+                        "The {alg} checksum listed for part {n} does not match the uploaded part"
+                    ),
+                ));
+            }
+            parts.push(part);
+        }
 
-        let mut all_block_hashes = Vec::new();
-        let mut total_size: i64 = 0;
+        let total_size: i64 = parts.iter().map(|p| p.size).sum();
+        if let Some(expected_size) = input.mpu_object_size
+            && expected_size != total_size
+        {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!(
+                    "x-amz-mp-object-size is {expected_size} but the listed parts total {total_size} bytes"
+                ),
+            ));
+        }
 
-        // S3 ETag for multipart is often <combined-md5>-<num-parts>
-        // But for simplicity and consistency with our HeadObject, we'll recompute MD5 if possible,
-        // or just use a synthetic one. Real S3 re-hashes the ETag of each part.
+        let mut object_checksum = self.multipart_object_checksum(&upload, &input, &parts)?;
+
+        // S3's multipart ETag: the MD5 of the concatenated binary part MD5s,
+        // then `-<number of parts>`.
         let mut etag_md5 = Md5::new();
-
-        for (_num, blocks, size, etag) in parts {
-            all_block_hashes.extend(blocks);
-            total_size += size;
-            let etag_bytes = hex::decode(etag.trim_matches('"')).map_err(|_| {
+        for part in &parts {
+            let etag_bytes = hex::decode(part.etag.trim_matches('"')).map_err(|_| {
                 S3Error::with_message(S3ErrorCode::InternalError, "Invalid part etag")
             })?;
             etag_md5.update(&etag_bytes);
         }
-
-        let final_etag = format!(
-            "{}-{}",
-            hex::encode(etag_md5.finalize()),
-            all_block_hashes.len()
-        );
+        let final_etag = format!("{}-{}", hex::encode(etag_md5.finalize()), parts.len());
+        let all_block_hashes: Vec<Vec<u8>> = parts.into_iter().flat_map(|p| p.blocks).collect();
         let shard_id = crate::hashing::compute_shard_id(&key);
 
         let obj_ref_id = format!("obj:{}:{}", input.bucket, key);
@@ -2476,12 +2700,14 @@ impl S3 for StorageBackend {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let output = CompleteMultipartUploadOutput {
+        let mut output = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket),
             key: Some(key),
             e_tag: Some(ETag::Strong(final_etag.to_string())),
+            checksum_type: object_checksum.checksum_type.take(),
             ..Default::default()
         };
+        set_checksums!(output, object_checksum);
         Ok(S3Response::new(output))
     }
 
@@ -2911,27 +3137,27 @@ mod tests {
         async fn create_multipart_upload(
             &self,
             _b: &str,
-            _k: &str,
             _u: uuid::Uuid,
+            _upload: &UploadRecord,
         ) -> Result<(), anyhow::Error> {
             Ok(())
         }
-        async fn get_multipart_upload_key(
+        async fn get_multipart_upload(
             &self,
             _b: &str,
             _u: uuid::Uuid,
-        ) -> Result<Option<String>, anyhow::Error> {
-            // Return "k" to match the key used in complete_input().
-            Ok(Some("k".to_string()))
+        ) -> Result<Option<UploadRecord>, anyhow::Error> {
+            // Key "k" to match the key used in complete_input().
+            Ok(Some(UploadRecord {
+                key: "k".to_string(),
+                ..Default::default()
+            }))
         }
         async fn insert_part(
             &self,
             _b: &str,
             _u: uuid::Uuid,
-            _n: i32,
-            _bl: Vec<Vec<u8>>,
-            _s: i64,
-            _e: &str,
+            _part: &PartRecord,
         ) -> Result<(), anyhow::Error> {
             Ok(())
         }
@@ -2939,12 +3165,16 @@ mod tests {
             &self,
             _b: &str,
             _u: uuid::Uuid,
-        ) -> Result<Vec<(i32, Vec<Vec<u8>>, i64, String)>, anyhow::Error> {
+        ) -> Result<Vec<PartRecord>, anyhow::Error> {
             // Return two small parts for multipart tests.
-            Ok(vec![
-                (1, vec![vec![0u8; 32]], 10, "aabbccdd".to_string()),
-                (2, vec![vec![1u8; 32]], 10, "eeff0011".to_string()),
-            ])
+            let part = |n: i32, fill: u8, etag: &str| PartRecord {
+                part_number: n,
+                blocks: vec![vec![fill; 32]],
+                size: 10,
+                etag: etag.to_string(),
+                checksums: String::new(),
+            };
+            Ok(vec![part(1, 0, "aabbccdd"), part(2, 1, "eeff0011")])
         }
         async fn delete_multipart_upload(
             &self,
@@ -3761,6 +3991,89 @@ mod tests {
             Err(e) => assert_eq!(e.code(), &S3ErrorCode::InvalidRequest),
             Ok(_) => panic!("expected InvalidRequest error for key mismatch"),
         }
+    }
+
+    async fn complete_err(input: CompleteMultipartUploadInput) -> S3ErrorCode {
+        let backend = make_backend(MockObjectStore::new(), MockBlockStore::new(), 64);
+        match backend.complete_multipart_upload(s3req(input)).await {
+            Err(e) => e.code().clone(),
+            Ok(_) => panic!("expected CompleteMultipartUpload to fail"),
+        }
+    }
+
+    fn listed_parts(input: &mut CompleteMultipartUploadInput) -> &mut Vec<CompletedPart> {
+        input
+            .multipart_upload
+            .as_mut()
+            .unwrap()
+            .parts
+            .as_mut()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_etag_counts_parts() {
+        let backend = make_backend(MockObjectStore::new(), MockBlockStore::new(), 64);
+        let res = backend
+            .complete_multipart_upload(s3req(complete_input(
+                "b",
+                "k",
+                &uuid::Uuid::new_v4().to_string(),
+            )))
+            .await
+            .unwrap();
+        let mut md5 = Md5::new();
+        md5.update(hex::decode("aabbccdd").unwrap());
+        md5.update(hex::decode("eeff0011").unwrap());
+        let want = format!("{}-2", hex::encode(md5.finalize()));
+        assert_eq!(res.output.e_tag.unwrap().into_value(), want);
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_uses_only_the_listed_parts() {
+        let objects = MockObjectStore::new();
+        let backend = make_backend(objects.clone(), MockBlockStore::new(), 64);
+        let mut input = complete_input("b", "k", &uuid::Uuid::new_v4().to_string());
+        listed_parts(&mut input).truncate(1);
+        let res = backend
+            .complete_multipart_upload(s3req(input))
+            .await
+            .unwrap();
+        assert!(res.output.e_tag.unwrap().value().ends_with("-1"));
+        let inserted = objects.inserted.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            inserted.2, 10,
+            "only part 1 (10 bytes) should be in the object: {inserted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_rejects_bad_part_lists() {
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let mut input = complete_input("b", "k", &id);
+        listed_parts(&mut input).reverse();
+        assert_eq!(complete_err(input).await, S3ErrorCode::InvalidPartOrder);
+
+        let mut input = complete_input("b", "k", &id);
+        listed_parts(&mut input)[1].part_number = Some(3);
+        assert_eq!(complete_err(input).await, S3ErrorCode::InvalidPart);
+
+        let mut input = complete_input("b", "k", &id);
+        listed_parts(&mut input)[0].e_tag = Some(ETag::Strong("00000000".to_string()));
+        assert_eq!(complete_err(input).await, S3ErrorCode::InvalidPart);
+
+        let mut input = complete_input("b", "k", &id);
+        listed_parts(&mut input)[0].checksum_crc32 = Some("AAAAAA==".to_string());
+        assert_eq!(complete_err(input).await, S3ErrorCode::InvalidPart);
+
+        let mut input = complete_input("b", "k", &id);
+        listed_parts(&mut input).clear();
+        assert_eq!(complete_err(input).await, S3ErrorCode::MalformedXML);
+
+        let mut input = complete_input("b", "k", &id);
+        input.mpu_object_size = Some(21);
+        assert_eq!(complete_err(input).await, S3ErrorCode::InvalidRequest);
     }
 
     // ── abort_multipart_upload ────────────────────────────────────────────────

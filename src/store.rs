@@ -100,6 +100,29 @@ pub struct FactRecord {
     pub fact: Fact,
 }
 
+/// An in-progress multipart upload.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UploadRecord {
+    pub key: String,
+    /// `x-amz-checksum-algorithm` from CreateMultipartUpload (e.g. `CRC64NVME`).
+    pub checksum_algorithm: Option<String>,
+    /// `x-amz-checksum-type` from CreateMultipartUpload (`COMPOSITE` or `FULL_OBJECT`).
+    pub checksum_type: Option<String>,
+}
+
+/// One uploaded part of a multipart upload.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PartRecord {
+    pub part_number: i32,
+    pub blocks: Vec<Vec<u8>>,
+    pub size: i64,
+    /// Hex MD5 of the part.
+    pub etag: String,
+    /// The part's verified checksums, as encoded by `integrity::encode_checksums`
+    /// (empty when the part was uploaded without any).
+    pub checksums: String,
+}
+
 /// Local health snapshot for `shardscape status`.
 pub struct StoreStats {
     pub live_objects: i64,
@@ -262,6 +285,18 @@ impl Store {
         );
         let _ = conn.execute(
             "ALTER TABLE users ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE multipart_uploads ADD COLUMN checksum_algorithm TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE multipart_uploads ADD COLUMN checksum_type TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE parts ADD COLUMN checksums TEXT NOT NULL DEFAULT ''",
             [],
         );
         Ok(())
@@ -730,27 +765,52 @@ impl Store {
     // ── multipart ────────────────────────────────────────────────────────────
 
     /// Backs the `ObjectStore::create_multipart_upload` trait method.
-    pub async fn insert_multipart(&self, bucket: &str, upload_id: Uuid, key: &str) -> Result<()> {
+    pub async fn insert_multipart(
+        &self,
+        bucket: &str,
+        upload_id: Uuid,
+        upload: &UploadRecord,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO multipart_uploads (bucket, upload_id, key) VALUES (?1, ?2, ?3)
-             ON CONFLICT(bucket, upload_id) DO UPDATE SET key = excluded.key",
-            params![bucket, upload_id.to_string(), key],
+            "INSERT INTO multipart_uploads (bucket, upload_id, key, checksum_algorithm, checksum_type)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(bucket, upload_id) DO UPDATE SET key = excluded.key,
+                checksum_algorithm = excluded.checksum_algorithm,
+                checksum_type = excluded.checksum_type",
+            params![
+                bucket,
+                upload_id.to_string(),
+                upload.key,
+                upload.checksum_algorithm,
+                upload.checksum_type
+            ],
         )?;
         Ok(())
     }
 
-    /// Backs the `ObjectStore::get_multipart_upload_key` trait method.
-    pub async fn get_multipart_key(&self, bucket: &str, upload_id: Uuid) -> Result<Option<String>> {
+    /// Backs the `ObjectStore::get_multipart_upload` trait method.
+    pub async fn get_multipart(
+        &self,
+        bucket: &str,
+        upload_id: Uuid,
+    ) -> Result<Option<UploadRecord>> {
         let conn = self.conn.lock().unwrap();
-        let key = conn
+        let upload = conn
             .query_row(
-                "SELECT key FROM multipart_uploads WHERE bucket = ?1 AND upload_id = ?2",
+                "SELECT key, checksum_algorithm, checksum_type FROM multipart_uploads
+                 WHERE bucket = ?1 AND upload_id = ?2",
                 params![bucket, upload_id.to_string()],
-                |r| r.get::<_, String>(0),
+                |r| {
+                    Ok(UploadRecord {
+                        key: r.get(0)?,
+                        checksum_algorithm: r.get(1)?,
+                        checksum_type: r.get(2)?,
+                    })
+                },
             )
             .optional()?;
-        Ok(key)
+        Ok(upload)
     }
 
     pub async fn delete_multipart_upload(&self, bucket: &str, upload_id: Uuid) -> Result<()> {
@@ -770,54 +830,45 @@ impl Store {
         &self,
         bucket: &str,
         upload_id: Uuid,
-        part_number: i32,
-        blocks: Vec<Vec<u8>>,
-        size: i64,
-        etag: &str,
+        part: &PartRecord,
     ) -> Result<()> {
-        let encoded = Self::encode_blocks(&blocks);
+        let encoded = Self::encode_blocks(&part.blocks);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO parts (bucket, upload_id, part_number, blocks, size, etag)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO parts (bucket, upload_id, part_number, blocks, size, etag, checksums)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(bucket, upload_id, part_number) DO UPDATE SET
-                blocks = excluded.blocks, size = excluded.size, etag = excluded.etag",
+                blocks = excluded.blocks, size = excluded.size, etag = excluded.etag,
+                checksums = excluded.checksums",
             params![
                 bucket,
                 upload_id.to_string(),
-                part_number,
+                part.part_number,
                 encoded,
-                size,
-                etag
+                part.size,
+                part.etag,
+                part.checksums
             ],
         )?;
         Ok(())
     }
 
-    pub async fn list_parts(
-        &self,
-        bucket: &str,
-        upload_id: Uuid,
-    ) -> Result<Vec<(i32, Vec<Vec<u8>>, i64, String)>> {
+    pub async fn list_parts(&self, bucket: &str, upload_id: Uuid) -> Result<Vec<PartRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT part_number, blocks, size, etag FROM parts
+            "SELECT part_number, blocks, size, etag, checksums FROM parts
              WHERE bucket = ?1 AND upload_id = ?2 ORDER BY part_number ASC",
         )?;
         let rows = stmt.query_map(params![bucket, upload_id.to_string()], |r| {
-            Ok((
-                r.get::<_, i32>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-            ))
+            Ok(PartRecord {
+                part_number: r.get(0)?,
+                blocks: Self::decode_blocks(&r.get::<_, Vec<u8>>(1)?),
+                size: r.get(2)?,
+                etag: r.get(3)?,
+                checksums: r.get(4)?,
+            })
         })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (n, raw, size, etag) = row?;
-            out.push((n, Self::decode_blocks(&raw), size, etag));
-        }
-        Ok(out)
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub async fn list_multipart_uploads(
@@ -1535,11 +1586,12 @@ mod tests {
     }
 
     // Regression: the `ObjectStore` trait methods `create_multipart_upload` and
-    // `get_multipart_upload_key` used to delegate to a same-named method on
-    // `self`, which resolved back to the trait method itself — unbounded async
-    // recursion that overflowed the stack and SIGABRT'd the node on any
-    // multipart PUT. This exercises the trait surface (not the inherent methods)
-    // so a re-introduction of the self-recursion overflows the test stack.
+    // `get_multipart_upload` (then `get_multipart_upload_key`) used to delegate
+    // to a same-named method on `self`, which resolved back to the trait
+    // method itself — unbounded async recursion that overflowed the stack and
+    // SIGABRT'd the node on any multipart PUT. This exercises the trait surface
+    // (not the inherent methods) so a re-introduction of the self-recursion
+    // overflows the test stack.
     #[tokio::test]
     async fn multipart_trait_delegation_round_trips_without_recursing() {
         use crate::storage::ObjectStore;
@@ -1547,42 +1599,56 @@ mod tests {
         let upload_id = Uuid::new_v4();
 
         // create → get key (this call is what overflowed before the fix).
-        ObjectStore::create_multipart_upload(&s, "test", "big.bin", upload_id)
+        let upload = UploadRecord {
+            key: "big.bin".to_string(),
+            checksum_algorithm: Some("CRC64NVME".to_string()),
+            checksum_type: Some("FULL_OBJECT".to_string()),
+        };
+        ObjectStore::create_multipart_upload(&s, "test", upload_id, &upload)
             .await
             .unwrap();
-        let key = ObjectStore::get_multipart_upload_key(&s, "test", upload_id)
+        let got = ObjectStore::get_multipart_upload(&s, "test", upload_id)
             .await
             .unwrap();
-        assert_eq!(key.as_deref(), Some("big.bin"));
+        assert_eq!(got, Some(upload));
 
         // Unknown upload id yields None rather than an error.
         assert!(
-            ObjectStore::get_multipart_upload_key(&s, "test", Uuid::new_v4())
+            ObjectStore::get_multipart_upload(&s, "test", Uuid::new_v4())
                 .await
                 .unwrap()
                 .is_none()
         );
 
         // Parts round-trip through the trait surface too.
-        ObjectStore::insert_part(&s, "test", upload_id, 1, vec![vec![1u8; 32]], 32, "e1")
+        let part = |n: i32, fill: u8, checksums: &str| PartRecord {
+            part_number: n,
+            blocks: vec![vec![fill; 32]],
+            size: 32,
+            etag: format!("e{n}"),
+            checksums: checksums.to_string(),
+        };
+        ObjectStore::insert_part(&s, "test", upload_id, &part(1, 1, "CRC64NVME:AAAAAAAAAAA="))
             .await
             .unwrap();
-        ObjectStore::insert_part(&s, "test", upload_id, 2, vec![vec![2u8; 32]], 32, "e2")
+        ObjectStore::insert_part(&s, "test", upload_id, &part(2, 2, ""))
             .await
             .unwrap();
         let parts = ObjectStore::list_parts(&s, "test", upload_id)
             .await
             .unwrap();
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].0, 1);
-        assert_eq!(parts[1].0, 2);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[0].checksums, "CRC64NVME:AAAAAAAAAAA=");
+        assert_eq!(parts[1].part_number, 2);
+        assert_eq!(parts[1].blocks, vec![vec![2u8; 32]]);
 
         // Abort/complete cleanup removes the upload and its parts.
         ObjectStore::delete_multipart_upload(&s, "test", upload_id)
             .await
             .unwrap();
         assert!(
-            ObjectStore::get_multipart_upload_key(&s, "test", upload_id)
+            ObjectStore::get_multipart_upload(&s, "test", upload_id)
                 .await
                 .unwrap()
                 .is_none()

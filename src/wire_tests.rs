@@ -630,3 +630,320 @@ async fn truncated_chunked_body_is_a_client_error_not_a_500() {
     );
     assert_eq!(get(&h, "/bucket/truncated").await.0, StatusCode::NOT_FOUND);
 }
+
+// ── multipart checksums ─────────────────────────────────────────────────────
+
+/// Returns (status, upload id, response XML, `x-amz-checksum-type` header).
+async fn create_upload(
+    h: &Harness,
+    path: &str,
+    extra: &[(&str, &str)],
+) -> (StatusCode, String, String, String) {
+    let (status, headers, resp) = call(
+        h,
+        request(
+            Method::POST,
+            path,
+            &[("uploads", "")],
+            extra,
+            Wire::Plain(vec![]),
+        ),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&resp).into_owned();
+    let id = crate::storage::xml_text(&text, "UploadId")
+        .unwrap_or_default()
+        .to_string();
+    let checksum_type = headers
+        .get("x-amz-checksum-type")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    (status, id, text, checksum_type)
+}
+
+/// Upload a part with an unsigned trailing checksum; returns its quoted ETag.
+async fn upload_part(
+    h: &Harness,
+    path: &str,
+    id: &str,
+    n: u32,
+    body: &[u8],
+    trailer: (&'static str, String),
+) -> String {
+    let n = n.to_string();
+    let req = request(
+        Method::PUT,
+        path,
+        &[("partNumber", &n), ("uploadId", id)],
+        &[],
+        Wire::UnsignedTrailer {
+            data: body.to_vec(),
+            trailer,
+        },
+    );
+    let (status, headers, resp) = call(h, req).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+    headers.get("etag").unwrap().to_str().unwrap().to_string()
+}
+
+/// A part as listed in CompleteMultipartUpload: (part number, quoted ETag,
+/// optional (XML element, checksum)).
+type ListedPart<'a> = (u32, &'a str, Option<(&'a str, &'a str)>);
+
+async fn complete(
+    h: &Harness,
+    path: &str,
+    id: &str,
+    parts: &[ListedPart<'_>],
+    extra: &[(&str, &str)],
+) -> (StatusCode, String) {
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (n, etag, checksum) in parts {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag>"
+        ));
+        if let Some((element, value)) = checksum {
+            xml.push_str(&format!("<{element}>{value}</{element}>"));
+        }
+        xml.push_str("</Part>");
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    let req = request(
+        Method::POST,
+        path,
+        &[("uploadId", id)],
+        extra,
+        Wire::Plain(xml.into_bytes()),
+    );
+    let (status, _, resp) = call(h, req).await;
+    (status, String::from_utf8_lossy(&resp).into_owned())
+}
+
+fn md5_raw(data: &[u8]) -> Vec<u8> {
+    <md5::Md5 as md5::Digest>::digest(data).to_vec()
+}
+
+#[tokio::test]
+async fn multipart_full_object_crc64nvme_like_aws_cli() {
+    // aws-cli's flow: CreateMultipartUpload declares CRC64NVME, each part
+    // trails its CRC64NVME, Complete lists each part's checksum and the size.
+    let h = harness().await;
+    let path = "/bucket/full.bin";
+    let (status, id, text, checksum_type) =
+        create_upload(&h, path, &[("x-amz-checksum-algorithm", "CRC64NVME")]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(checksum_type, "FULL_OBJECT");
+
+    let (p1, p2) = (data(300 * 1024, 11), data(50 * 1024 + 9, 12));
+    let (c1, c2) = (crc64nvme(&p1), crc64nvme(&p2));
+    let e1 = upload_part(
+        &h,
+        path,
+        &id,
+        1,
+        &p1,
+        ("x-amz-checksum-crc64nvme", c1.clone()),
+    )
+    .await;
+    let e2 = upload_part(
+        &h,
+        path,
+        &id,
+        2,
+        &p2,
+        ("x-amz-checksum-crc64nvme", c2.clone()),
+    )
+    .await;
+    let whole = [p1.as_slice(), p2.as_slice()].concat();
+    let size = whole.len().to_string();
+
+    // A part checksum in the Complete list that doesn't match the upload.
+    let parts_bad = [
+        (1, e1.as_str(), Some(("ChecksumCRC64NVME", c2.as_str()))),
+        (2, e2.as_str(), None),
+    ];
+    let (status, text) = complete(&h, path, &id, &parts_bad, &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert_eq!(s3_code(text.as_bytes()), "InvalidPart");
+
+    let parts = [
+        (1, e1.as_str(), Some(("ChecksumCRC64NVME", c1.as_str()))),
+        (2, e2.as_str(), Some(("ChecksumCRC64NVME", c2.as_str()))),
+    ];
+    // A wrong whole-object checksum is BadDigest.
+    let wrong = crc64nvme(b"something else");
+    let (status, text) = complete(
+        &h,
+        path,
+        &id,
+        &parts,
+        &[("x-amz-checksum-crc64nvme", &wrong)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert_eq!(s3_code(text.as_bytes()), "BadDigest");
+
+    let want = crc64nvme(&whole);
+    let (status, text) = complete(
+        &h,
+        path,
+        &id,
+        &parts,
+        &[
+            ("x-amz-checksum-crc64nvme", &want),
+            ("x-amz-mp-object-size", &size),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        crate::storage::xml_text(&text, "ChecksumCRC64NVME"),
+        Some(want.as_str())
+    );
+    assert_eq!(
+        crate::storage::xml_text(&text, "ChecksumType"),
+        Some("FULL_OBJECT")
+    );
+    // ETag is MD5(md5(p1) || md5(p2))-2, with the part count (not the block
+    // count: these parts span 4 blocks) as the suffix.
+    let etag = hex::encode(md5_raw(&[md5_raw(&p1), md5_raw(&p2)].concat()));
+    assert_eq!(
+        crate::storage::xml_text(&text, "ETag"),
+        Some(format!("\"{etag}-2\"").as_str())
+    );
+
+    assert!(get(&h, path).await.1 == whole);
+}
+
+#[tokio::test]
+async fn multipart_composite_crc32c_and_full_object_crc32() {
+    let h = harness().await;
+    let (p1, p2) = (data(120 * 1024, 13), data(1000, 14));
+
+    // CRC32C defaults to COMPOSITE: base64(CRC32C(raw1 || raw2))-2.
+    let path = "/bucket/composite.bin";
+    let (_, id, _, _) = create_upload(&h, path, &[("x-amz-checksum-algorithm", "CRC32C")]).await;
+    let e1 = upload_part(
+        &h,
+        path,
+        &id,
+        1,
+        &p1,
+        ("x-amz-checksum-crc32c", crc32c(&p1)),
+    )
+    .await;
+    let e2 = upload_part(
+        &h,
+        path,
+        &id,
+        2,
+        &p2,
+        ("x-amz-checksum-crc32c", crc32c(&p2)),
+    )
+    .await;
+    let raw = [
+        s3s::crypto::Crc32c::checksum(&p1),
+        s3s::crypto::Crc32c::checksum(&p2),
+    ]
+    .concat();
+    let want = format!("{}-2", crc32c(&raw));
+    let (status, text) = complete(&h, path, &id, &[(1, &e1, None), (2, &e2, None)], &[]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        crate::storage::xml_text(&text, "ChecksumCRC32C"),
+        Some(want.as_str())
+    );
+    assert_eq!(
+        crate::storage::xml_text(&text, "ChecksumType"),
+        Some("COMPOSITE")
+    );
+
+    // CRC32 with FULL_OBJECT requested: the CRC32 of the whole object, even
+    // though the parts were sent with CRC64NVME (the declared CRC32 is
+    // computed for every part regardless).
+    let path = "/bucket/full-crc32.bin";
+    let (status, id, text, _) = create_upload(
+        &h,
+        path,
+        &[
+            ("x-amz-checksum-algorithm", "CRC32"),
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let e1 = upload_part(
+        &h,
+        path,
+        &id,
+        1,
+        &p1,
+        ("x-amz-checksum-crc64nvme", crc64nvme(&p1)),
+    )
+    .await;
+    let e2 = upload_part(
+        &h,
+        path,
+        &id,
+        2,
+        &p2,
+        ("x-amz-checksum-crc64nvme", crc64nvme(&p2)),
+    )
+    .await;
+    let whole = [p1.as_slice(), p2.as_slice()].concat();
+    let want = BASE64.encode(s3s::crypto::Crc32::checksum(&whole));
+    let (status, text) = complete(&h, path, &id, &[(1, &e1, None), (2, &e2, None)], &[]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        crate::storage::xml_text(&text, "ChecksumCRC32"),
+        Some(want.as_str())
+    );
+    assert_eq!(
+        crate::storage::xml_text(&text, "ChecksumType"),
+        Some("FULL_OBJECT")
+    );
+
+    // SHA256 cannot be FULL_OBJECT.
+    let (status, _, text, _) = create_upload(
+        &h,
+        "/bucket/nope",
+        &[
+            ("x-amz-checksum-algorithm", "SHA256"),
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+}
+
+#[tokio::test]
+async fn multipart_complete_assembles_only_the_listed_parts() {
+    let h = harness().await;
+    let path = "/bucket/subset.bin";
+    let (_, id, _, _) = create_upload(&h, path, &[]).await;
+    let parts: Vec<Vec<u8>> = (0..3).map(|i| data(40 * 1024 + i, 20 + i as u64)).collect();
+    let mut etags = Vec::new();
+    for (i, p) in parts.iter().enumerate() {
+        etags.push(
+            upload_part(
+                &h,
+                path,
+                &id,
+                i as u32 + 1,
+                p,
+                ("x-amz-checksum-crc64nvme", crc64nvme(p)),
+            )
+            .await,
+        );
+    }
+    let (status, text) = complete(
+        &h,
+        path,
+        &id,
+        &[(1, &etags[0], None), (3, &etags[2], None)],
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(get(&h, path).await.1 == [parts[0].as_slice(), parts[2].as_slice()].concat());
+}
